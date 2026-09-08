@@ -176,7 +176,13 @@ class DFlashAttention(nn.Module):
         v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q, seq_len=total_len)
+        rope_seq_len = max(
+            total_len,
+            int(full_position_ids.detach().max().item()) + 1
+            if full_position_ids.numel() > 0
+            else total_len,
+        )
+        cos, sin = self.rotary_emb(q, seq_len=rope_seq_len)
         cos = cos.to(q.device).squeeze(1).squeeze(0)
         sin = sin.to(q.device).squeeze(1).squeeze(0)
 
@@ -337,6 +343,42 @@ class DFlashDraftModel(PreTrainedModel):
         )
         self.norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def save_pretrained(self, save_directory, *args, **kwargs):
+        """Preserve the legacy PyTorch checkpoint request on Transformers 5."""
+        safe_serialization = kwargs.pop("safe_serialization", None)
+        state_dict = kwargs.get("state_dict")
+
+        # Transformers 5 consumes the supplied state dict with ``pop`` while
+        # producing its safetensors checkpoint.  Keep the tensor references
+        # before that call for the explicit legacy PyTorch export below.  A
+        # shallow copy is sufficient: serialization never mutates tensors.
+        legacy_state_dict = None
+        if (
+            safe_serialization is False
+            and kwargs.get("is_main_process", True)
+            and state_dict is not None
+        ):
+            legacy_state_dict = state_dict.copy()
+        result = super().save_pretrained(save_directory, *args, **kwargs)
+
+        if safe_serialization is not False or not kwargs.get("is_main_process", True):
+            return result
+
+        if legacy_state_dict is None:
+            legacy_state_dict = self.state_dict()
+        torch.save(
+            legacy_state_dict, os.path.join(save_directory, "pytorch_model.bin")
+        )
+
+        # Transformers 5 always writes safetensors. Do not keep a duplicate
+        # full checkpoint when the caller explicitly requested PyTorch weights.
+        for filename in os.listdir(save_directory):
+            if filename == "model.safetensors.index.json" or (
+                filename.startswith("model") and filename.endswith(".safetensors")
+            ):
+                os.remove(os.path.join(save_directory, filename))
+        return result
+
     def extract_context_feature(
         self, all_hidden_states: list[torch.Tensor]
     ) -> torch.Tensor:
@@ -362,14 +404,39 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        for layer in self.layers:
+        per_layer_block_masks = (
+            list(block_mask) if isinstance(block_mask, (list, tuple)) else None
+        )
+        per_layer_dense_masks = (
+            list(dense_attention_mask)
+            if isinstance(dense_attention_mask, (list, tuple))
+            else None
+        )
+        if per_layer_block_masks is not None and len(per_layer_block_masks) != len(
+            self.layers
+        ):
+            raise ValueError("per-layer block masks must match the number of draft layers")
+        if per_layer_dense_masks is not None and len(per_layer_dense_masks) != len(
+            self.layers
+        ):
+            raise ValueError("per-layer dense masks must match the number of draft layers")
+
+        for layer_idx, layer in enumerate(self.layers):
             draft_hidden = layer(
                 draft_hidden=draft_hidden,
                 context_hidden=context_feature,
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
-                block_mask=block_mask,
-                dense_attention_mask=dense_attention_mask,
+                block_mask=(
+                    per_layer_block_masks[layer_idx]
+                    if per_layer_block_masks is not None
+                    else block_mask
+                ),
+                dense_attention_mask=(
+                    per_layer_dense_masks[layer_idx]
+                    if per_layer_dense_masks is not None
+                    else dense_attention_mask
+                ),
             )
         return self.norm(draft_hidden)
 

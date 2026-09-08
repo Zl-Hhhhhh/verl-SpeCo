@@ -63,8 +63,11 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
 
     assert raw.speco.verl_base.version == "0.8.0"
     assert raw.speco.verl_base.branch == "release/v0.8.0"
+    assert raw.speco.checkpoint.save_offset == 0
     assert drafter.enable is False
     assert drafter.enable_drafter_training is False
+    assert drafter.resume_model_path is None
+    assert drafter.training.worker_world_size is None
     assert drafter.training.collect_hidden_states_from_sgl is False
     assert drafter.training.collect_hidden_states_from_old_logprob is False
     assert drafter.vllm.allow_lossy_speculative_sampling is False
@@ -75,6 +78,43 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.min_lr_ratio == pytest.approx(0.1)
     assert drafter.training.warmup_style is None
     assert drafter.training.resume_trainer_state_from_checkpoint is True
+    assert drafter.training.fixed_eval_samples_per_replica == 0
+    assert drafter.training.train_unique_samples_first is False
+    assert drafter.training.dspark_trace_aligned_anchors is False
+    assert drafter.training.dspark_loss_decay_gamma == pytest.approx(0.0)
+    assert drafter.training.dspark_ce_loss_alpha == pytest.approx(0.0)
+    assert drafter.training.dspark_l1_loss_alpha == pytest.approx(0.0)
+    assert drafter.training.dspark_accepted_k3_alpha == pytest.approx(1.0)
+    assert drafter.training.dspark_accepted_fkl_alpha == pytest.approx(0.0)
+    assert drafter.training.dspark_rejected_k3_alpha == pytest.approx(1.0)
+    assert drafter.training.dspark_response_stream_weight == pytest.approx(1.0)
+    assert drafter.training.dspark_rejected_stream_weight == pytest.approx(1.0)
+    assert drafter.training.dspark_rejected_position_decay == pytest.approx(0.9)
+    assert drafter.training.dspark_topk_support == "student"
+    assert drafter.training.dspark_first_rejection_ce_alpha == 0.0
+    assert drafter.training.dspark_rejected_first_weight_multiplier == pytest.approx(1.0)
+    assert drafter.training.dspark_rejected_suffix_weight_multiplier == pytest.approx(1.0)
+    assert drafter.training.dspark_asymmetric_k3_enabled is False
+    assert drafter.training.dspark_accepted_asymmetric_k3_enabled is None
+    assert drafter.training.dspark_rejected_asymmetric_k3_enabled is None
+    assert drafter.training.dspark_asymmetric_k3_positive_threshold == pytest.approx(
+        2.0
+    )
+    assert drafter.training.dspark_dynamic_accept_reject_weighting_enabled is False
+    assert drafter.training.dspark_dynamic_stream_weight_min_multiplier == pytest.approx(
+        0.25
+    )
+    assert drafter.training.dspark_dynamic_stream_weight_max_multiplier == pytest.approx(
+        4.0
+    )
+    assert drafter.training.dspark_k3_distribution_bins == 512
+    assert drafter.training.dspark_dump_k3_logprobs is False
+    assert drafter.training.dspark_dump_k3_logprobs_dir is None
+    assert drafter.training.dspark_dump_k3_logprobs_interval_steps == 1
+    assert drafter.training.dspark_dump_k3_logprobs_max_tokens_per_stream == 0
+    assert drafter.training.post_update_mean_acceptance_length_drop_abort_threshold == pytest.approx(
+        0.5
+    )
     assert drafter.training.eagle1_num_hidden_layers == 1
 
 

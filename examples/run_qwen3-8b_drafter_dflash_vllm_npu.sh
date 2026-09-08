@@ -1,4 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
 set -x
+
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -15,9 +18,14 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
+SPECO_PYTHON=${SPECO_PYTHON:-/workspace/main_env_next/bin/python}
+SPECO_RUNTIME_SETUP=${SPECO_RUNTIME_SETUP:-/workspace/main_env_next/bin/activate-speco-cann901-v1.sh}
+# shellcheck disable=SC1090
+source "${SPECO_RUNTIME_SETUP}"
+
 # NPU example for the native DFlash proposer in vLLM.
-project_name='verl_grpo_example_dflash_drafter'
-exp_name='qwen3_8b_dflash_drafter_vllm_npu'
+project_name=${WANDB_PROJECT:-verl_grpo_example_dflash_drafter}
+exp_name=${WANDB_RUN_NAME:-qwen3_8b_dflash_drafter_vllm_npu}
 
 gen_tp=2
 train_sp=4
@@ -25,14 +33,14 @@ ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dflash-drafter
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/workspace/data/dapo_math_17k_verl/train.parquet}
+TEST_FILE=${TEST_FILE:-/workspace/data/dapo_math_17k_verl/test.parquet}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dflash-drafter}
+TRAINER_LOGGERS=${TRAINER_LOGGERS:-'["console"]'}
 
-
-PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
+PYTHONUNBUFFERED=1 "${SPECO_PYTHON}" -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     transfer_queue.enable=False \
     ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
@@ -88,7 +96,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.dflash_num_anchors=64 \
     actor_rollout_ref.rollout.drafter.training.dflash_max_window=512 \
-    actor_rollout_ref.rollout.drafter.training.dflash_loss_mode=restricted_ce \
+    actor_rollout_ref.rollout.drafter.training.dflash_loss_mode=chunked_ce \
+    actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
     actor_rollout_ref.rollout.drafter.training.dflash_loss_decay_gamma=7 \
     actor_rollout_ref.rollout.drafter.training.dflash_front_position_weight=2.0 \
     actor_rollout_ref.rollout.drafter.training.dflash_front_position_count=3 \
@@ -112,7 +121,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.use_kl_in_reward=False \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console"]' \
+    trainer.logger="${TRAINER_LOGGERS}" \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
@@ -121,4 +130,4 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.total_training_steps=200 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=6 $@
+    trainer.total_epochs=6 "$@"

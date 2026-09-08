@@ -48,6 +48,25 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
     )
 
 
+def test_release_materialized_payload_clears_tensor_references(monkeypatch) -> None:
+    collected = []
+    trimmed = []
+    monkeypatch.setattr(rollout_publish.gc, "collect", lambda: collected.append(True))
+    monkeypatch.setattr(
+        rollout_publish,
+        "trim_process_host_memory",
+        lambda: trimmed.append(True) or {"heap_trimmed": True},
+    )
+    payload = {"weight": object()}
+
+    result = rollout_publish.release_materialized_draft_weights_payload(payload)
+
+    assert payload == {}
+    assert collected == [True]
+    assert trimmed == [True]
+    assert result == {"heap_trimmed": True}
+
+
 def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert rollout_publish.rollout_backend_name({"rollout": {"name": "vllm"}}) == "vllm"
     assert (
@@ -196,6 +215,7 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
     trainer.model = SimpleNamespace(
         draft_model=SimpleNamespace(),
         state_dict=lambda: {
+            "draft_model.embed_tokens.weight": torch.ones(4, 2),
             "draft_model.fc.weight": torch.ones(2, 4),
             "draft_model.hidden_norm.weight": torch.ones(2),
             "draft_model.norm.weight": torch.ones(2),

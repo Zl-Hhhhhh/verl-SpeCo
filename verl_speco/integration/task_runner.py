@@ -13,10 +13,10 @@
 # limitations under the License.
 """TaskRunner hook for the SPECO trainer."""
 
-import os
-import socket
 import json
 import logging
+import os
+import socket
 from contextlib import contextmanager, nullcontext
 from pprint import pprint
 
@@ -38,6 +38,87 @@ def _serialize_drafter_config(config):
     except Exception:  # noqa: BLE001
         return ""
     return json.dumps(drafter, sort_keys=True) if isinstance(drafter, dict) else ""
+
+
+def _restore_drafter_model_path_from_checkpoint(config):
+    """Point both rollout and training at the drafter matching the committed global step."""
+    from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+    from verl_speco.trainer.checkpoint import (
+        is_pretrained_drafter_checkpoint,
+        resolve_drafter_checkpoint_path,
+        rewrite_block_drafter_runtime_config,
+    )
+
+    drafter = config.actor_rollout_ref.rollout.drafter
+    if not bool(drafter.enable and drafter.enable_drafter_training):
+        return None
+
+    trainer_cfg = config.trainer
+    resume_mode = str(trainer_cfg.get("resume_mode", "auto") or "auto")
+    if resume_mode == "disable":
+        return None
+
+    if resume_mode == "resume_path":
+        actor_checkpoint = trainer_cfg.get("resume_from_path")
+    elif resume_mode == "auto":
+        default_local_dir = trainer_cfg.get("default_local_dir")
+        actor_checkpoint = (
+            find_latest_ckpt_path(os.path.abspath(os.fspath(default_local_dir)))
+            if default_local_dir
+            else None
+        )
+    else:
+        logger.warning(
+            "Unknown trainer.resume_mode=%s; skip drafter path restore", resume_mode
+        )
+        return None
+
+    checkpoint_name = os.path.basename(
+        os.path.normpath(os.fspath(actor_checkpoint or ""))
+    )
+    if not checkpoint_name.startswith("global_step_"):
+        return None
+    try:
+        global_step = int(checkpoint_name.removeprefix("global_step_"))
+    except ValueError:
+        return None
+
+    default_local_dir = trainer_cfg.get("default_local_dir")
+    checkpoint_root = drafter.get("checkpoint_path")
+    if not checkpoint_root and default_local_dir:
+        checkpoint_root = os.path.join(str(default_local_dir), "drafter")
+    original_model_path = drafter.get("model_path")
+    runtime_config_source_model_path = (
+        drafter.get("runtime_config_source_model_path") or original_model_path
+    )
+    explicit_resume_model_path = drafter.get("resume_model_path")
+    if explicit_resume_model_path:
+        model_path = os.path.realpath(os.fspath(explicit_resume_model_path))
+        if not is_pretrained_drafter_checkpoint(model_path):
+            raise RuntimeError(
+                "Explicit drafter resume checkpoint is incomplete or invalid: "
+                f"{model_path}"
+            )
+    else:
+        model_path = resolve_drafter_checkpoint_path(
+            original_model_path, checkpoint_root, global_step
+        )
+    if model_path == original_model_path:
+        return None
+
+    algorithm = str(drafter.get("speculative_algorithm", "") or "").lower()
+    if algorithm in {"dflash", "dspark"}:
+        rewrite_block_drafter_runtime_config(
+            algorithm,
+            runtime_config_source_model_path,
+            model_path,
+        )
+
+    with open_dict(drafter):
+        drafter.model_path = model_path
+        drafter.runtime_config_source_model_path = runtime_config_source_model_path
+        drafter.checkpoint_path = checkpoint_root
+    return model_path
 
 
 def _unwrap_ray_remote_actor_class(worker_cls):
@@ -245,8 +326,11 @@ class SpecoTaskRunner(TaskRunner):
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
         print(f"SpecoTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        restored_drafter_path = _restore_drafter_model_path_from_checkpoint(config)
+        if restored_drafter_path is not None:
+            print(f"Resuming drafter rollout and training from {restored_drafter_path}")
+        pprint(OmegaConf.to_container(config, resolve=True))
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         actor_rollout_cls = self._with_speco_rollout_publish_mixin(

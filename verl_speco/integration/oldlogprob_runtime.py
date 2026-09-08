@@ -543,6 +543,25 @@ def _put_oldlogprob_hidden_refs(
     return updated
 
 
+def _assign_oldlogprob_non_tensor_output(final_output, key: str, value: Any) -> None:
+    """Attach sample-aligned ObjectRef metadata without losing DP shards on cat."""
+    from verl.utils import tensordict_utils as tu
+
+    batch_size = int(final_output.batch_size[0])
+    if (
+        key
+        in {
+            OLD_LOGPROB_HIDDEN_REFS_KEY,
+            OLD_LOGPROB_HIDDEN_REF_META_KEY,
+        }
+        and isinstance(value, list)
+        and len(value) == batch_size
+    ):
+        tu.assign_non_tensor_stack(final_output, key, value)
+        return
+    tu.assign_non_tensor_data(final_output, key, value)
+
+
 def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
     global _POSTPROCESS_PATCHED
     if _POSTPROCESS_PATCHED:
@@ -586,12 +605,10 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
 
         final_output = postprocess_output(self, output, *args, **kwargs)
         if speco_non_tensor and final_output is not None:
-            from verl.utils import tensordict_utils as tu
-
             for key, value in speco_non_tensor.items():
                 # These ObjectRef side-channel payloads use original sample indices and
                 # chunk-level metadata; they are not shaped like upstream tensor outputs.
-                tu.assign_non_tensor_data(final_output, key, value)
+                _assign_oldlogprob_non_tensor_output(final_output, key, value)
         return final_output
 
     worker_cls._postprocess_output = speco_postprocess_output

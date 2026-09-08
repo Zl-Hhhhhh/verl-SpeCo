@@ -42,6 +42,9 @@ from verl.utils.distributed import (
     initialize_global_process_group_ray,
     set_numa_affinity,
 )
+from verl_speco.trainer.dspark_training_config import (
+    dspark_target_distribution_loss_enabled,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -125,6 +128,30 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
     for row_indices, part in pieces:
         output[row_indices] = part.to(device=output.device, dtype=output.dtype)
     return output.unsqueeze(0)
+
+
+def _resolve_sample_hidden_state_ref(
+    hidden_ref, hidden_ref_meta, expected_rows: int | None = None
+):
+    """Resolve one sample from an owner-shared hidden-state ObjectRef chunk."""
+    if isinstance(hidden_ref_meta, dict) and int(
+        hidden_ref_meta.get("chunk_length", 0) or 0
+    ) > 0:
+        return _resolve_hidden_state_chunks(
+            [
+                {
+                    "ref": hidden_ref,
+                    "chunk_start": hidden_ref_meta.get("chunk_start", 0),
+                    "chunk_length": hidden_ref_meta.get("chunk_length", 0),
+                    "chunk_row_indices": hidden_ref_meta.get("chunk_row_indices"),
+                }
+            ],
+            expected_rows=expected_rows,
+        )
+    hidden = _resolve_ray_object_ref(hidden_ref)
+    if torch.is_tensor(hidden) and hidden.dim() == 2:
+        hidden = hidden.unsqueeze(0)
+    return hidden
 
 
 @dataclass(frozen=True)
@@ -500,17 +527,19 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
-    ):
+    ) -> int:
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
             or self.trainer is None
         ):
-            return
+            return 0
         if self._drafter_training_mode() == "collect_only":
             self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
-            return
-        self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+            return 1
+        return int(
+            self.trainer.collect_online_data(batch, hidden_states, target_logprobs) or 0
+        )
 
     def _drafter_training_mode(self) -> str:
         return (
@@ -636,17 +665,15 @@ class SpecoWorker(Worker):
             _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         )
         algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
-        dspark_l1_enabled = (
+        dspark_target_distribution_enabled = (
             algorithm == "DSPARK"
-            and float(
-                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
-                or 0.0
+            and dspark_target_distribution_loss_enabled(
+                self.config.rollout.drafter.training
             )
-            > 0
         )
         default_hidden_layout = (
             "dflash_aux_plus_last"
-            if dspark_l1_enabled
+            if dspark_target_distribution_enabled
             else "dflash_aux"
             if algorithm in {"DFLASH", "DSPARK"}
             else "eagle3_aux_plus_last"
@@ -684,6 +711,10 @@ class SpecoWorker(Worker):
             "hidden_last_hidden_select",
             "target_logprobs_position_start",
             "target_logprobs_position_end",
+            "hidden_window_stratum",
+            "speculative_trace",
+            "speculative_trace_diagnostics",
+            "sample_id",
         ):
             if key in batch:
                 metadata[key] = batch[key]
@@ -794,11 +825,22 @@ class SpecoWorker(Worker):
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
     def collect_rollout_features(self, samples: list[dict]):
+        result = {
+            "received_samples": 0,
+            "stored_samples": 0,
+            "missing_hidden_samples": 0,
+            "received_sample_ids": [],
+            "sample_ids": [],
+        }
         if not samples:
-            return
+            return result
         for sample in samples:
             if not sample:
                 continue
+            result["received_samples"] += 1
+            sample_id = sample.get("sample_id")
+            if sample_id not in (None, ""):
+                result["received_sample_ids"].append(str(sample_id))
             batch = {
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
@@ -824,6 +866,10 @@ class SpecoWorker(Worker):
                 "hidden_states_layout",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
+                "hidden_window_stratum",
+                "speculative_trace",
+                "speculative_trace_diagnostics",
+                "sample_id",
                 "global_step",
             ):
                 if key in sample:
@@ -841,20 +887,36 @@ class SpecoWorker(Worker):
                         hidden_chunks, expected_rows=expected_rows
                     )
                 else:
-                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    hidden_positions = batch.get("hidden_positions")
+                    expected_rows = (
+                        int(hidden_positions.numel())
+                        if torch.is_tensor(hidden_positions)
+                        else None
+                    )
+                    hidden = _resolve_sample_hidden_state_ref(
+                        sample.get("hidden_states_ref"),
+                        sample.get("hidden_states_ref_meta"),
+                        expected_rows=expected_rows,
+                    )
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
                 target_logprobs = _resolve_ray_object_ref(
                     sample.get("target_logprobs_ref")
                 )
             if hidden is None:
+                result["missing_hidden_samples"] += 1
                 continue
-            self._store_rollout_sample(
+            stored = self._store_rollout_sample(
                 batch=batch,
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
             )
+            result["stored_samples"] += stored
+            if stored > 0 and sample_id not in (None, ""):
+                result["sample_ids"].append(str(sample_id))
         self._flush_rollout_features_for_step()
+        result["unique_sample_ids"] = len(set(result["sample_ids"]))
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
@@ -877,6 +939,7 @@ class SpecoWorker(Worker):
         self,
         global_step: int,
         wait: bool = True,
+        include_optimizer: bool = True,
     ):
         if not self.enable_drafter:
             return {"saved": False, "reason": "disabled"}
@@ -887,6 +950,7 @@ class SpecoWorker(Worker):
         result = self.trainer.save_checkpoint(
             int(global_step),
             wait=wait,
+            include_optimizer=include_optimizer,
         )
         if self.is_drafter_group_leader:
             logger.debug(
@@ -1049,6 +1113,19 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
+                fixed_eval_pre = self.trainer.evaluate_fixed_cohort()
+                for key, value in fixed_eval_pre.items():
+                    result[f"drafter/fixed_cohort/pre_{key}"] = value
+                candidate_gate_enabled = bool(
+                    self.config.rollout.drafter.training.get(
+                        "candidate_gate_enabled", False
+                    )
+                )
+                if candidate_gate_enabled:
+                    candidate_ready = self.trainer.begin_candidate_update(
+                        self.last_global_step
+                    )
+                    result["candidate_baseline_cached"] = int(candidate_ready)
                 for _ in range(self.train_steps_per_trigger):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
@@ -1057,15 +1134,31 @@ class SpecoWorker(Worker):
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
+                    fixed_eval_post = self.trainer.evaluate_fixed_cohort()
+                    for key, value in fixed_eval_post.items():
+                        result[f"drafter/fixed_cohort/post_{key}"] = value
+                    for key in set(fixed_eval_pre).intersection(fixed_eval_post):
+                        if key in {"samples", "source_step"} or key.startswith(
+                            "trace_"
+                        ):
+                            continue
+                        result[f"drafter/fixed_cohort/delta_{key}"] = (
+                            fixed_eval_post[key] - fixed_eval_pre[key]
+                        )
                     should_prepare_publish = (
                         self.publish_interval_steps <= 0
                         or self.last_global_step % self.publish_interval_steps == 0
                     )
                     if should_prepare_publish:
                         snapshot_ts = time.time()
-                        cached = self.trainer.prepare_model_state_dict_for_publish(
-                            self.last_global_step
-                        )
+                        if candidate_gate_enabled:
+                            cached = self.trainer.prepare_candidate_update(
+                                self.last_global_step
+                            )
+                        else:
+                            cached = self.trainer.prepare_model_state_dict_for_publish(
+                                self.last_global_step
+                            )
                         result["publish_snapshot_cached"] = int(cached)
                         result["publish_snapshot_elapsed_sec"] = (
                             time.time() - snapshot_ts
@@ -1077,8 +1170,12 @@ class SpecoWorker(Worker):
                             )
                     else:
                         self.trainer.clear_pending_publish_state_dict()
+                        if candidate_gate_enabled:
+                            self.trainer.clear_candidate_update()
                 else:
                     self.trainer.clear_pending_publish_state_dict()
+                    if candidate_gate_enabled:
+                        self.trainer.clear_candidate_update()
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
@@ -1126,3 +1223,27 @@ class SpecoWorker(Worker):
             return None
 
         return {"weights_ref": ray.put(weights)}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_candidate_weights(self, global_step: int, alpha: float):
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
+            return None
+        ready, weights = self.trainer.get_candidate_state_dict(global_step, alpha)
+        if not ready or not self.is_global_publish_leader:
+            return None
+        return {"weights_ref": ray.put(weights)}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def finalize_candidate_update(self, global_step: int, alpha: float):
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
+            return {"finalized": False, "reason": "not_in_training_group"}
+        finalized = self.trainer.finalize_candidate_update(global_step, alpha)
+        return {"finalized": bool(finalized), "alpha": float(alpha)}

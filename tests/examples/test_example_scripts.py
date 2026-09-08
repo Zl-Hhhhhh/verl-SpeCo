@@ -13,8 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -47,7 +47,9 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     source = script.read_text(encoding="utf-8")
 
     assert (
-        "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
+        "python3 -m verl_speco.main" in source
+        or "python -m verl_speco.main" in source
+        or '"${SPECO_PYTHON}" -m verl_speco.main' in source
     )
     assert "actor_rollout_ref.rollout.drafter.enable=" in source
     assert "actor_rollout_ref.rollout.drafter.enable_drafter_training=" in source

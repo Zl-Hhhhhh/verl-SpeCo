@@ -32,11 +32,19 @@ _DEFAULT_EXTRA_KEYS = {
     "max_global_steps",
     "extras",
     "drafter_sample",
+    "speculative_trace",
+    "speculative_trace_diagnostics",
 }
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
+_CURRENT_MAX_TOKENS = contextvars.ContextVar(
+    "speco_current_max_tokens", default=None
+)
+_CURRENT_SPEC_TRACE_HISTORY = contextvars.ContextVar(
+    "speco_current_spec_trace_history", default=None
+)
 SPECO_AGENT_LOOP_MANAGER_CLASS = (
     "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
 )
@@ -104,11 +112,14 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
         patched.setdefault("_verl_global_steps", global_steps)
     if bool(_CURRENT_VALIDATE.get()):
         patched["_verl_skip_drafter_collection"] = True
+    max_tokens = _CURRENT_MAX_TOKENS.get()
+    if max_tokens is not None:
+        patched["max_tokens"] = int(max_tokens)
     return patched
 
 
 def _sampling_params_with_speco_step(
-    sampling_params: Any, *, global_steps: Any, validate: bool
+    sampling_params: Any, *, global_steps: Any, validate: bool, max_tokens: Any = None
 ) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
@@ -117,6 +128,8 @@ def _sampling_params_with_speco_step(
         patched["_verl_global_steps"] = global_steps
     if validate:
         patched["_verl_skip_drafter_collection"] = True
+    if max_tokens is not None:
+        patched["max_tokens"] = int(max_tokens)
     return patched
 
 
@@ -148,17 +161,74 @@ def _speco_default_agent_loop_inputs(inputs: Any) -> Any:
     return inputs
 
 
-def _speco_context_from_batch(batch: Any) -> tuple[Any, Any]:
+def _speco_context_from_batch(batch: Any) -> tuple[Any, Any, Any]:
     meta_info = getattr(batch, "meta_info", None)
     meta_info = meta_info if isinstance(meta_info, dict) else {}
     global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
-    return global_steps_token, validate_token
+    max_tokens_token = _CURRENT_MAX_TOKENS.set(
+        meta_info.get("speco_candidate_gate_max_tokens")
+    )
+    return global_steps_token, validate_token, max_tokens_token
 
 
-def _speco_reset_context(global_steps_token: Any, validate_token: Any) -> None:
+def _speco_reset_context(
+    global_steps_token: Any, validate_token: Any, max_tokens_token: Any
+) -> None:
+    _CURRENT_MAX_TOKENS.reset(max_tokens_token)
     _CURRENT_VALIDATE.reset(validate_token)
     _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+
+
+def _accumulate_agent_loop_speculative_trace(result: Any, request_id: Any) -> Any:
+    history = _CURRENT_SPEC_TRACE_HISTORY.get()
+    extra_fields = getattr(result, "extra_fields", None)
+    if not isinstance(history, dict) or not isinstance(extra_fields, dict):
+        return result
+    trace = extra_fields.get("speculative_trace")
+    diagnostics = extra_fields.get("speculative_trace_diagnostics")
+    if not isinstance(trace, (list, tuple)) and not isinstance(diagnostics, dict):
+        return result
+
+    request_key = str(request_id)
+    request_history = history.setdefault(
+        request_key, {"events": [], "diagnostics": {}, "generation_count": 0}
+    )
+    generation_index = int(request_history["generation_count"])
+    request_history["generation_count"] = generation_index + 1
+    events = request_history["events"]
+    if isinstance(trace, (list, tuple)):
+        events.extend(
+            {
+                **event,
+                "generation_index": generation_index,
+            }
+            if isinstance(event, dict)
+            else event
+            for event in trace
+        )
+    history_diagnostics = request_history["diagnostics"]
+    if isinstance(diagnostics, dict):
+        for key, value in diagnostics.items():
+            try:
+                history_diagnostics[str(key)] = int(
+                    history_diagnostics.get(str(key), 0)
+                ) + int(value or 0)
+            except (TypeError, ValueError):
+                continue
+    history_diagnostics["agent_generations_received"] = int(
+        history_diagnostics.get("agent_generations_received", 0)
+    ) + 1
+    history_diagnostics["agent_request_id_missing"] = int(
+        history_diagnostics.get("agent_request_id_missing", 0)
+    ) + int(request_id is None)
+    history_diagnostics["agent_trace_events_received"] = len(events)
+    # ToolAgentLoop stores this list by reference on the first turn. Extending
+    # the same object makes later generation events visible without patching
+    # upstream's integer-only SPEC_DECODE_EXTRA_KEYS aggregation.
+    extra_fields["speculative_trace"] = events
+    extra_fields["speculative_trace_diagnostics"] = history_diagnostics
+    return result
 
 
 def _speco_worker_init(self, *args, **kwargs):
@@ -169,7 +239,9 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    global_steps_token, validate_token = _speco_context_from_batch(batch)
+    global_steps_token, validate_token, max_tokens_token = _speco_context_from_batch(
+        batch
+    )
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
@@ -182,7 +254,7 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        _speco_reset_context(global_steps_token, validate_token)
+        _speco_reset_context(global_steps_token, validate_token, max_tokens_token)
 
 
 async def _speco_worker_run_agent_loop(
@@ -193,16 +265,21 @@ async def _speco_worker_run_agent_loop(
         sampling_params,
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
+        max_tokens=trajectory.get("speco_candidate_gate_max_tokens"),
     )
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+    trace_history_token = _CURRENT_SPEC_TRACE_HISTORY.set({})
+    try:
+        result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    finally:
+        _CURRENT_SPEC_TRACE_HISTORY.reset(trace_history_token)
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -424,7 +501,8 @@ def install_agent_loop_runtime_patch() -> bool:
             result = llm_server_generate(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            return result
+            request_id = kwargs.get("request_id")
+            return _accumulate_agent_loop_speculative_trace(result, request_id)
 
         llm_server_client_cls.generate = speco_llm_server_generate
         llm_server_client_cls._speco_patched_generate = True
@@ -441,12 +519,16 @@ def install_agent_loop_runtime_patch() -> bool:
             validate_token = _CURRENT_VALIDATE.set(
                 bool(meta_info.get("validate", False))
             )
+            max_tokens_token = _CURRENT_MAX_TOKENS.set(
+                meta_info.get("speco_candidate_gate_max_tokens")
+            )
             try:
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
+                _CURRENT_MAX_TOKENS.reset(max_tokens_token)
                 _CURRENT_VALIDATE.reset(validate_token)
                 _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
 
@@ -464,11 +546,18 @@ def install_agent_loop_runtime_patch() -> bool:
                 sampling_params,
                 global_steps=trajectory.get("step"),
                 validate=bool(trajectory.get("validate", False)),
+                max_tokens=trajectory.get("speco_candidate_gate_max_tokens"),
             )
-            result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            trace_history_token = _CURRENT_SPEC_TRACE_HISTORY.set({})
+            try:
+                result = run_agent_loop(
+                    self, sampling_params, trajectory, *args, **kwargs
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                _CURRENT_SPEC_TRACE_HISTORY.reset(trace_history_token)
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True

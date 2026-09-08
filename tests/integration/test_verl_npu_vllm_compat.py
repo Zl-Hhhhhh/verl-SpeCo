@@ -24,6 +24,9 @@ from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
 def test_factory_fused_moe_survives_verl_npu_patch_import(monkeypatch) -> None:
+    monkeypatch.delitem(
+        sys.modules, compat._VERL_NPU_VLLM_PATCH_MODULE, raising=False
+    )
     vllm = types.ModuleType("vllm")
     vllm.__version__ = "0.23.0"
     fused_moe_module = types.ModuleType(compat._VLLM_FUSED_MOE_MODULE)
@@ -69,6 +72,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
+        "install_verl_npu_checkpoint_load_compat",
+        lambda: events.append("checkpoint_load"),
+    )
+    monkeypatch.setattr(
+        compat,
         "install_verl_npu_checkpoint_reclaim",
         lambda: events.append("reclaim"),
     )
@@ -89,9 +97,71 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     assert events == [
         "compat",
         "training_output_release",
+        "checkpoint_load",
         "reclaim",
         "fsdp2_export",
         "base",
+    ]
+
+
+def test_npu_checkpoint_load_maps_global_tag_to_actor_local_device(monkeypatch) -> None:
+    events = []
+
+    class FakeTorch:
+        npu = types.SimpleNamespace(device_count=lambda: 1, current_device=lambda: 7)
+
+        @staticmethod
+        def device(location):
+            return ("device", location)
+
+        @staticmethod
+        def load(path, map_location=None, **kwargs):
+            events.append(("load", path, map_location, set(kwargs)))
+            if isinstance(map_location, dict):
+                return map_location["npu:7"], map_location[("device", "npu:7")]
+            return map_location
+
+    checkpoint_module = types.ModuleType(compat._VERL_FSDP_CHECKPOINT_MODULE)
+    checkpoint_module.torch = FakeTorch
+
+    class FSDPCheckpointManager:
+        rank = 0
+        world_size = 16
+
+        def load_checkpoint(self, local_path, **kwargs):
+            del kwargs
+            return (
+                checkpoint_module.torch.load(local_path, weights_only=False),
+                checkpoint_module.torch.load(
+                    "explicit.pt", map_location="cpu", weights_only=False
+                ),
+                checkpoint_module.torch.load(
+                    "positional.pt", "cpu", weights_only=False
+                ),
+            )
+
+    checkpoint_module.FSDPCheckpointManager = FSDPCheckpointManager
+    modules = {
+        compat._VERL_FSDP_CHECKPOINT_MODULE: checkpoint_module,
+        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_NPU_CHECKPOINT_LOAD_APPLIED", False)
+
+    assert compat.install_verl_npu_checkpoint_load_compat(modules.__getitem__) is True
+    manager = FSDPCheckpointManager()
+    assert manager.load_checkpoint("rank-7.pt") == (
+        ("npu:0", ("device", "npu:0")),
+        "cpu",
+        "cpu",
+    )
+    assert checkpoint_module.torch is FakeTorch
+    assert events[0][:2] == ("load", "rank-7.pt")
+    assert isinstance(events[0][2], dict)
+    assert events[0][3] == {"weights_only"}
+    assert events[1:] == [
+        ("load", "explicit.pt", "cpu", {"weights_only"}),
+        ("load", "positional.pt", "cpu", {"weights_only"}),
     ]
 
 

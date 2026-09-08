@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 _VERL_NPU_VLLM_PATCH_MODULE = "verl.utils.vllm.npu_vllm_patch"
 _VLLM_FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe"
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
+_VERL_FSDP_CHECKPOINT_MODULE = "verl.utils.checkpoint.fsdp_checkpoint_manager"
 _IMPORT_COMPAT_APPLIED = False
+_NPU_CHECKPOINT_LOAD_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
@@ -214,6 +216,94 @@ def install_verl_npu_checkpoint_reclaim(
     engine_cls.save_checkpoint = save_checkpoint_with_reclaim
     _NPU_CHECKPOINT_RECLAIM_APPLIED = True
     logger.warning("Enabled post-save NPU actor checkpoint host-memory reclaim")
+    return True
+
+
+def install_verl_npu_checkpoint_load_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Remap globally tagged NPU checkpoint tensors to a Ray actor's local NPU.
+
+    Ray exposes one logical NPU to each worker, while a checkpoint saved by
+    verl can retain the physical/global tag (for example ``npu:7``).  Scope the
+    remap to verl's FSDP loader so unrelated ``torch.load`` calls keep their
+    native behavior.
+    """
+
+    global _NPU_CHECKPOINT_LOAD_APPLIED
+    if _NPU_CHECKPOINT_LOAD_APPLIED or not _module_available("torch_npu"):
+        return False
+
+    device_module = module_importer("verl.utils.device")
+    if device_module.get_device_name() != "npu":
+        return False
+
+    checkpoint_module = module_importer(_VERL_FSDP_CHECKPOINT_MODULE)
+    checkpoint_cls = getattr(checkpoint_module, "FSDPCheckpointManager", None)
+    if checkpoint_cls is None:
+        return False
+    original_load_checkpoint = getattr(checkpoint_cls, "load_checkpoint", None)
+    if original_load_checkpoint is None or getattr(
+        original_load_checkpoint,
+        "_speco_npu_checkpoint_load_compat",
+        False,
+    ):
+        return False
+
+    @functools.wraps(original_load_checkpoint)
+    def load_checkpoint_on_local_npu(self, *args, **kwargs):
+        torch_module = checkpoint_module.torch
+        npu_module = getattr(torch_module, "npu", None)
+        if npu_module is None:
+            return original_load_checkpoint(self, *args, **kwargs)
+
+        device_count = int(npu_module.device_count())
+        if device_count < 1:
+            return original_load_checkpoint(self, *args, **kwargs)
+        current_device = int(npu_module.current_device())
+        local_device = current_device if 0 <= current_device < device_count else 0
+        target_location = f"npu:{local_device}"
+        target_device = torch_module.device(target_location)
+        source_count = max(int(getattr(self, "world_size", 0) or 0), device_count)
+        map_location = {
+            "npu": target_location,
+            torch_module.device("npu"): target_device,
+        }
+        for source_device in range(source_count):
+            source_location = f"npu:{source_device}"
+            map_location[source_location] = target_location
+            map_location[torch_module.device(source_location)] = target_device
+        native_torch_load = torch_module.load
+
+        def checkpoint_torch_load(*load_args, **load_kwargs):
+            if len(load_args) < 2 and load_kwargs.get("map_location") is None:
+                load_kwargs["map_location"] = map_location
+            return native_torch_load(*load_args, **load_kwargs)
+
+        class _CheckpointTorchProxy:
+            load = staticmethod(checkpoint_torch_load)
+
+            def __getattr__(self, name):
+                return getattr(torch_module, name)
+
+        checkpoint_module.torch = _CheckpointTorchProxy()
+        try:
+            if int(getattr(self, "rank", 0) or 0) == 0:
+                logger.warning(
+                    "[actor checkpoint] remapping serialized NPU tensors to %s",
+                    target_location,
+                )
+            return original_load_checkpoint(self, *args, **kwargs)
+        finally:
+            checkpoint_module.torch = torch_module
+
+    setattr(
+        load_checkpoint_on_local_npu,
+        "_speco_npu_checkpoint_load_compat",
+        True,
+    )
+    checkpoint_cls.load_checkpoint = load_checkpoint_on_local_npu
+    _NPU_CHECKPOINT_LOAD_APPLIED = True
     return True
 
 
@@ -406,6 +496,7 @@ class VerlNPUVLLMImportCompatMixin:
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
+        install_verl_npu_checkpoint_load_compat()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)

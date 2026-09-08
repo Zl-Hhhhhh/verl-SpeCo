@@ -16,8 +16,6 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
-import json
 import logging
 import os
 from typing import Any, cast
@@ -31,6 +29,7 @@ from verl.utils.device import get_device_name, get_torch_device
 from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
 from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+from verl_speco.trainer.checkpoint import rewrite_block_drafter_runtime_config
 from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoader,
     DraftFeatureDataLoaderConfig,
@@ -263,53 +262,12 @@ def _finalize_standalone_checkpoint(
     _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
 
 
-def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
-    value = config.get(key)
-    if isinstance(value, dict):
-        return value
-    value = {}
-    config[key] = value
-    return value
-
-
-def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
-    model_path = getattr(
-        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
-    )
-    model_path = getattr(model_path, "model_path", None)
-    if not model_path:
-        return None
-    config_path = os.path.join(os.fspath(model_path), "config.json")
-    if not os.path.exists(config_path):
-        return None
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
-        return None
-    return loaded if isinstance(loaded, dict) else None
-
-
-def _fill_if_missing(
-    dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]
-) -> None:
-    for key in keys:
-        if key in src and key not in dst:
-            dst[key] = deepcopy(src[key])
-
-
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
     completed_future=None,
 ) -> None:
-    """Export standalone DFlash/DSpark checkpoints with runtime-facing config.
-
-    The training wrapper saves an internal SpeCo config.  For standalone
-    checkpoints we keep the original drafter ``config.json`` as the runtime
-    contract and only merge the alias fields needed by vLLM/SGLang.
-    """
+    """Compatibility wrapper for standalone and older trainer adapters."""
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
     if backend_type not in {"dflash", "dspark"}:
         return
@@ -324,103 +282,19 @@ def _rewrite_standalone_block_runtime_config(
             )
             return
 
-    config_path = os.path.join(checkpoint_path, "config.json")
-    if not os.path.exists(config_path):
-        logger.warning(
-            "Cannot rewrite standalone runtime config: missing %s", config_path
-        )
-        return
-
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            training_config = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
+        drafter = getattr(
+            getattr(getattr(trainer, "config", None), "rollout", None),
+            "drafter",
+            None,
         )
-        return
-    if not isinstance(training_config, dict):
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        source_model_path = getattr(drafter, "model_path", None)
+        rewrite_block_drafter_runtime_config(
+            backend_type, source_model_path, checkpoint_path
         )
-        return
-
-    training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
-    try:
-        with open(training_config_path, "w", encoding="utf-8") as f:
-            json.dump(training_config, f, indent=2, sort_keys=True)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Failed to write standalone training config copy %s: %s",
-            training_config_path,
-            exc,
-        )
-
-    runtime_config = _load_source_drafter_config(trainer)
-    if runtime_config is None:
-        runtime_config = deepcopy(training_config)
-        logger.warning(
-            "Source drafter config is unavailable; standalone checkpoint keeps SpeCo training config as runtime config"
-        )
-
-    runtime_config["speco_training_model_type"] = backend_type
-    common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
-    _fill_if_missing(runtime_config, training_config, common_alias_keys)
-
-    dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
-    _fill_if_missing(dflash_config, training_config, common_alias_keys)
-
-    if backend_type == "dspark":
-        dspark_config = _ensure_dict_child(runtime_config, "dspark_config")
-        _fill_if_missing(
-            dspark_config,
-            training_config,
-            (
-                "block_size",
-                "num_anchors",
-                "markov_rank",
-                "markov_head_type",
-                "confidence_head_alpha",
-                "confidence_head_with_markov",
-                "ce_loss_alpha",
-                "l1_loss_alpha",
-                "loss_decay_gamma",
-                "target_layer_ids",
-                "num_context_layers",
-                "num_target_layers",
-                "target_num_hidden_layers",
-                "mask_token_id",
-            ),
-        )
-    else:
-        dspark_config = {}
-
-    target_layer_ids = (
-        runtime_config.get("target_layer_ids")
-        or dflash_config.get("target_layer_ids")
-        or dspark_config.get("target_layer_ids")
-    )
-    if (
-        target_layer_ids is not None
-        and "eagle_aux_hidden_state_layer_ids" not in runtime_config
-    ):
-        try:
-            runtime_config["eagle_aux_hidden_state_layer_ids"] = [
-                int(layer_id) + 1 for layer_id in target_layer_ids
-            ]
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid target_layer_ids in standalone exported config: %r",
-                target_layer_ids,
-            )
-
-    try:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(runtime_config, f, indent=2, sort_keys=True)
-            f.write("\n")
-    except OSError as exc:
-        logger.warning(
-            "Failed to write standalone runtime config %s: %s", config_path, exc
+            "Failed to write standalone runtime config %s: %s", checkpoint_path, exc
         )
 
 

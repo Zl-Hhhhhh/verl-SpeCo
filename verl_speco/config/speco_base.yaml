@@ -6,6 +6,11 @@
 speco:
   enable: true
 
+  checkpoint:
+    # Shift periodic actor/drafter saves away from online publish steps.
+    # With save_freq=10 and offset=1, saves run at 11, 21, 31, ... .
+    save_offset: 0
+
   verl_base:
     version: "0.8.0"
     branch: release/v0.8.0
@@ -28,7 +33,12 @@ actor_rollout_ref:
       enable_drafter_training: false
       speculative_algorithm: EAGLE3
       model_path: /path/to/drafter/model
+      # Stable metadata source retained when model_path switches to a checkpoint.
+      runtime_config_source_model_path: null
       checkpoint_path: null
+      # Explicit recovery override for rolling the drafter back independently
+      # while the actor resumes from its latest committed checkpoint.
+      resume_model_path: null
       world_size: 16
 
       rollout:
@@ -41,6 +51,14 @@ actor_rollout_ref:
         draft_tensor_parallel_size: null
         max_model_len: null
         enforce_eager: null
+        # DSpark serving modes. full preserves the checkpoint behavior; swa is
+        # uniform non-causal context SWA. Mixed hybrid/sparse modes fail closed
+        # until the vLLM DFlash cache supports mixed per-layer attention.
+        dspark_attention_mode: full
+        # Counts actor-context tokens only. For DSpark SWA, SPECO automatically
+        # adds the draft block size to vLLM-Ascend's runtime adapter window.
+        dspark_context_window: null
+        dspark_runtime_overlay_root: null
         speculative_config_overrides: {}
         # RL rollout assumes exact target-distribution verification. Set this
         # only when intentionally opting into a lossy acceptance method.
@@ -48,6 +66,9 @@ actor_rollout_ref:
 
       training:
         mode: online
+        # Limit online drafter workers without changing the actor/rollout pool.
+        # Must be divisible by rollout TP * DP * PP. Null uses the full pool.
+        worker_world_size: null
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
         # SGLang does not apply the target final norm to captured aux states.
@@ -59,12 +80,56 @@ actor_rollout_ref:
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
         max_collect_tokens_per_step_per_replica: 16384
-        hidden_state_window_mode: front
+        # Deterministically sample windows from the front/middle/tail thirds.
+        hidden_state_window_mode: stratified
+        hidden_state_window_strata_weights: [0.34, 0.33, 0.33]
         hidden_state_window_tokens_per_sample: 512
         hidden_state_window_min_rows: 512
         hidden_state_random_max_offset: null
         hidden_state_random_seed_by_step: true
         hidden_state_max_tokens_per_sample: null
+        # Skip a drafter update when trace or hidden-state transport silently loses
+        # samples. Set collection_integrity_fail_action=raise for strict debugging.
+        spec_trace_min_sample_coverage: 0.95
+        spec_trace_min_teacher_logprob_coverage: 0.95
+        oldlogprob_min_materialization_ratio: 0.95
+        oldlogprob_min_consumption_ratio: 0.95
+        collection_integrity_fail_action: skip
+        # Maximum allowed absolute mean-acceptance drop. Transactional candidate
+        # mode rolls back and regenerates; legacy direct publish aborts the run.
+        post_update_mean_acceptance_length_drop_abort_threshold: 0.5
+        # Transactional candidate publication. Online experiment launchers may
+        # enable this; the repository-wide default preserves legacy behavior.
+        candidate_gate_enabled: false
+        candidate_gate_alphas: [0.0, 0.25, 0.5, 1.0]
+        candidate_gate_samples: 16
+        candidate_gate_max_tokens: 256
+        candidate_gate_min_acceptance_delta: 0.0
+        candidate_gate_max_ms_per_token_regression: 0.15
+        candidate_max_fixed_loss_delta: 0.0
+        candidate_max_grad_norm: 50.0
+        candidate_grad_norm_rolling_multiplier: 5.0
+        candidate_max_rejected_k3_clamp_ratio: 0.5
+        candidate_max_rejected_k3_median: 9.5
+        save_best_drafter_checkpoint: true
+        best_checkpoint_min_acceptance_delta: 0.0
+        # Retain separate acceptance/TPS best checkpoints using the first full
+        # rollout after each synchronous publish. This adds no evaluation rollout.
+        dual_metric_best_checkpoint_enabled: false
+        best_checkpoint_min_throughput_relative_delta: 0.0
+        # Dual bests are inference/evaluation artifacts; periodic and final
+        # checkpoints still include optimizer state for resume.
+        dual_metric_best_checkpoint_include_optimizer: false
+        fixed_eval_seed: 17
+        fixed_eval_sample_rate: 0.1
+        # Persistent per-replica cohort used for drafter pre/post update evaluation.
+        fixed_eval_samples_per_replica: 0
+        # Optional immutable rollout cohorts for later drafter comparisons.
+        # Export before actor update; retain actor checkpoints at step-1.
+        fixed_eval_export_steps: []
+        fixed_eval_export_samples: 128
+        fixed_eval_export_seed: 17
+        fixed_eval_export_dir: null
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
@@ -82,6 +147,8 @@ actor_rollout_ref:
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
+        # Prefer samples not yet consumed in the current collection cycle.
+        train_unique_samples_first: false
         lr: 1e-5
         lr_warmup_steps: 0
         lr_scheduler_type: constant
@@ -110,11 +177,15 @@ actor_rollout_ref:
         dflash_mask_token_id: null
         dflash_target_layer_ids: null
         dflash_max_window: 512
+        # chunked_ce is exact full-vocab CE with token-wise activation checkpointing.
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        dflash_ce_token_chunk_size: 64
         dspark_block_size: 7
         dspark_num_anchors: 32
-        dspark_loss_decay_gamma: 7.0
+        # Draft-OPD response tokens are not position-decayed; rejected suffixes
+        # use their own decay below.
+        dspark_loss_decay_gamma: 0.0
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
         dspark_num_target_layers: 5
@@ -122,15 +193,82 @@ actor_rollout_ref:
         dspark_mask_token_id: null
         dspark_target_layer_ids: null
         dspark_max_window: 512
+        # Optional attention-context experiments. full is the existing baseline.
+        # swa crops only actor context; hybrid restores the final N layers to full;
+        # sparse_global restores selected prefix/prompt/actor pages in those layers.
+        dspark_attention_mode: full
+        dspark_context_window: null
+        dspark_global_layer_count: 1
+        # Keep disabled for exact legacy behavior. Enable for cropped/nonzero-offset
+        # windows so context and draft RoPE use their original sequence positions.
+        dspark_use_absolute_position_ids: false
+        dspark_global_prefix_tokens: 0
+        dspark_global_prompt_tokens: 0
+        dspark_actor_guided_page_size: 16
+        dspark_actor_guided_page_budget_tokens: 0
+        dspark_actor_guided_page_starts_field: actor_selected_context_page_starts
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
+        dspark_ce_token_chunk_size: 64
         dspark_markov_rank: 256
         dspark_markov_head_type: vanilla
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
-        dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.45
+        # Draft-OPD-equivalent direct distillation defaults: sampled K3 on both
+        # the response and rejected-draft streams with joint token normalization.
+        dspark_ce_loss_alpha: 0.0
+        # Independent CE on the correct replacement at the first rejection.
+        # Adds alpha * global_mean_first_rejection_CE, without K3 clamps.
+        # Requires trace-aligned anchors; zero preserves the existing objective.
+        dspark_first_rejection_ce_alpha: 0.0
+        dspark_l1_loss_alpha: 0.0
+        dspark_trace_aligned_anchors: false
+        dspark_accepted_k3_alpha: 1.0
+        dspark_accepted_fkl_alpha: 0.0
+        dspark_rejected_k3_alpha: 1.0
+        # Independent objective selectors. Existing *_k3_alpha coefficients
+        # multiply the selected objective; stream weighting/decay are unchanged.
+        # Response uses current-student support; rejected uses verified rollout
+        # student support (candidate IDs are fixed during each training cycle).
+        dspark_response_loss: k3
+        dspark_rejected_loss: k3
+        dspark_topk: 16
+        # union combines student top-k and teacher top-k, deduplicated before
+        # subset normalization. Rejected candidates come from rollout verify.
+        dspark_topk_support: student
+        dspark_response_stream_weight: 1.0
+        dspark_rejected_stream_weight: 1.0
+        dspark_rejected_position_decay: 0.9
+        # Optional extra weights on the rejected branch, relative to its first
+        # rejection. Keep absolute-position decay and joint token normalization.
+        dspark_rejected_first_weight_multiplier: 1.0
+        dspark_rejected_suffix_weight_multiplier: 1.0
+        dspark_rejected_log_ratio_clamp: 20.0
+        dspark_rejected_loss_max_clamp: 10.0
+        # Optional robust K3 tail policy. Above the positive delta threshold,
+        # continue with K3's tangent; keep the negative tail unchanged.
+        dspark_asymmetric_k3_enabled: false
+        # Null inherits the master switch above. Set accepted=false and
+        # rejected=true to isolate asymmetric K3 to rejected draft tokens.
+        dspark_accepted_asymmetric_k3_enabled: null
+        dspark_rejected_asymmetric_k3_enabled: null
+        dspark_asymmetric_k3_positive_threshold: 2.0
+        # Optional per-microbatch inverse-frequency balancing. Base stream
+        # weights remain the desired response:rejected token-mass ratio.
+        dspark_dynamic_accept_reject_weighting_enabled: false
+        dspark_dynamic_stream_weight_min_multiplier: 0.25
+        dspark_dynamic_stream_weight_max_multiplier: 4.0
+        # Mergeable weighted histogram used for global K3 median curves. Mean,
+        # min, and max remain exact; median resolution is clamp / bins.
+        dspark_k3_distribution_bins: 512
+        # Optional per-token analysis dump for the sampled K3 token only. It
+        # records target/draft logprobs, token IDs, K3, weights, and positions.
+        dspark_dump_k3_logprobs: false
+        dspark_dump_k3_logprobs_dir: null
+        dspark_dump_k3_logprobs_interval_steps: 1
+        # Zero keeps every K3 token. Set a positive per-stream cap to limit I/O.
+        dspark_dump_k3_logprobs_max_tokens_per_stream: 0
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

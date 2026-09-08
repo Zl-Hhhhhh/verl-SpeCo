@@ -13,10 +13,13 @@
 # limitations under the License.
 """Draft-weight publishing helpers for SPECO rollout adapters."""
 
+import gc
 import logging
 import os
 import time
 from typing import Any, Optional, cast
+
+from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -81,6 +84,22 @@ def materialize_draft_weights_payload(weights: Any) -> tuple[Any, bool]:
     if object_ref_type and isinstance(weights, object_ref_type):
         return ray.get(weights), True
     return weights, False
+
+
+def release_materialized_draft_weights_payload(weights: Any) -> dict[str, Any]:
+    """Release a Ray-materialized publish payload and return its heap pages.
+
+    Each actor-rollout rank resolves the same full draft state dict before
+    forwarding it to its vLLM worker. Dropping Python references alone can
+    leave large CPU allocations in allocator arenas and raise the baseline for
+    the next publish.
+    """
+
+    clear = getattr(weights, "clear", None)
+    if callable(clear):
+        clear()
+    gc.collect()
+    return trim_process_host_memory()
 
 
 def resolve_drafter_publish_payload(published_payload: Any) -> Any:
@@ -496,7 +515,17 @@ class DraftWeightPublishMixin:
                 time.perf_counter() - materialize_ts,
                 len(weights) if weights else 0,
             )
-        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        try:
+            await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        finally:
+            if used_ref:
+                release_started = time.perf_counter()
+                release_materialized_draft_weights_payload(weights)
+                logger.warning(
+                    "[speco publish release] async=False global_steps=%s elapsed_sec=%.3f",
+                    global_steps,
+                    time.perf_counter() - release_started,
+                )
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_draft_weights_async(
@@ -515,7 +544,17 @@ class DraftWeightPublishMixin:
                 time.perf_counter() - materialize_ts,
                 len(weights) if weights else 0,
             )
-        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        try:
+            await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        finally:
+            if used_ref:
+                release_started = time.perf_counter()
+                release_materialized_draft_weights_payload(weights)
+                logger.warning(
+                    "[speco publish release] async=True global_steps=%s elapsed_sec=%.3f",
+                    global_steps,
+                    time.perf_counter() - release_started,
+                )
 
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))

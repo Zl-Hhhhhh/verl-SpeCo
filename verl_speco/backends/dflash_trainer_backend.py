@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
@@ -55,6 +56,9 @@ def _create_dflash_mask_mod(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    *,
+    context_window: int | None = None,
+    global_context_mask: torch.Tensor | None = None,
 ):
     """Create DFlash block attention mask.
 
@@ -67,6 +71,13 @@ def _create_dflash_mask_mod(
         anchor_pos = anchor_positions[b, q_block_id]
         is_context = kv_idx < ctx_len
         mask_context = is_context & (kv_idx < anchor_pos)
+        if context_window is not None:
+            recent_context = kv_idx >= (anchor_pos - context_window)
+            if global_context_mask is not None:
+                safe_context_idx = kv_idx.clamp(min=0, max=max(ctx_len - 1, 0))
+                selected_global = is_context & global_context_mask[b, safe_context_idx]
+                recent_context = recent_context | selected_global
+            mask_context = mask_context & recent_context
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
@@ -83,6 +94,9 @@ def _create_dflash_dense_attention_mask(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    *,
+    context_window: int | None = None,
+    global_context_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the dense equivalent of the DFlash/DSpark training block mask.
 
@@ -102,6 +116,20 @@ def _create_dflash_dense_attention_mask(
 
     context_indices = torch.arange(ctx_len, device=device)
     context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
+    if context_window is not None:
+        recent_context = context_indices.view(1, 1, ctx_len) >= (
+            query_anchors.unsqueeze(-1) - context_window
+        )
+        if global_context_mask is not None:
+            if global_context_mask.shape != (bsz, ctx_len):
+                raise ValueError(
+                    "global_context_mask must have shape [batch, context_length], "
+                    f"got {tuple(global_context_mask.shape)}"
+                )
+            recent_context = recent_context | global_context_mask.to(
+                device=device, dtype=torch.bool
+            ).unsqueeze(1)
+        context_allowed = context_allowed & recent_context
 
     draft_block_ids = torch.arange(draft_len, device=device) // block_size
     draft_allowed = (
@@ -140,6 +168,7 @@ class DFlashTrainingModel(nn.Module):
         front_position_count: int = 0,
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
+        ce_token_chunk_size: int = 64,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -149,8 +178,18 @@ class DFlashTrainingModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.front_position_weight = float(front_position_weight)
         self.front_position_count = max(int(front_position_count), 0)
-        self.loss_mode = str(loss_mode or "full_vocab")
+        requested_loss_mode = str(loss_mode or "full_vocab").strip().lower()
+        if requested_loss_mode == "restricted_ce":
+            logger.warning(
+                "restricted_ce is deprecated and now uses exact chunked "
+                "full-vocabulary CE; set the drafter loss mode to chunked_ce explicitly"
+            )
+            requested_loss_mode = "chunked_ce"
+        if requested_loss_mode not in {"full_vocab", "chunked_ce", "sampled_ce"}:
+            raise ValueError(f"Unsupported DFlash loss mode: {requested_loss_mode!r}")
+        self.loss_mode = requested_loss_mode
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
+        self.ce_token_chunk_size = max(int(ce_token_chunk_size), 1)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
     def _cached_arange(
@@ -230,18 +269,33 @@ class DFlashTrainingModel(nn.Module):
         ).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
         return torch.where(keep_mask, selected, 0), keep_mask
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor, seq_len: int):
+    def _create_position_ids(
+        self,
+        anchor_positions: torch.Tensor,
+        seq_len: int,
+        context_position_ids: torch.Tensor | None = None,
+    ):
         bsz = anchor_positions.shape[0]
         device = anchor_positions.device
-        context_position_ids = (
-            self._cached_arange("context_positions", seq_len, device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-        )
+        if context_position_ids is None:
+            context_position_ids = (
+                self._cached_arange("context_positions", seq_len, device)
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
+        elif context_position_ids.shape != (bsz, seq_len):
+            raise ValueError(
+                "context_position_ids must have shape [batch, context_length], "
+                f"got {tuple(context_position_ids.shape)}"
+            )
+        context_position_ids = context_position_ids.to(device=device, dtype=torch.long)
         offsets = self._cached_arange(
             "block_offsets", self.block_size, device, view_shape=(1, 1, -1)
         )
-        draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
+        absolute_anchors = torch.gather(
+            context_position_ids, 1, anchor_positions.clamp(0, max(seq_len - 1, 0))
+        )
+        draft_position_ids = absolute_anchors.unsqueeze(-1) + offsets
         return context_position_ids, draft_position_ids.view(bsz, -1)
 
     def _create_noise_embed(
@@ -302,6 +356,84 @@ class DFlashTrainingModel(nn.Module):
                 )
             )
         return torch.unique(torch.cat(candidates), sorted=True)
+
+    def _full_vocab_logits(
+        self,
+        active_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        active_prev_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del active_prev_tokens
+        return F.linear(active_hidden, lm_head_weight)
+
+    def _chunked_exact_cross_entropy(
+        self,
+        *,
+        active_hidden: torch.Tensor,
+        active_targets: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        active_prev_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute exact full-vocabulary CE without retaining full-batch logits."""
+
+        active_count = int(active_hidden.size(0))
+        if active_count <= 0:
+            return active_hidden.new_zeros((0,), dtype=torch.float32)
+        losses = []
+        for start in range(0, active_count, self.ce_token_chunk_size):
+            end = min(start + self.ce_token_chunk_size, active_count)
+            hidden_chunk = active_hidden[start:end]
+            target_chunk = active_targets[start:end]
+            prev_chunk = (
+                active_prev_tokens[start:end]
+                if active_prev_tokens is not None
+                else None
+            )
+
+            def chunk_loss(
+                hidden: torch.Tensor,
+                targets: torch.Tensor,
+                head_weight: torch.Tensor,
+                previous_tokens: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                logits = self._full_vocab_logits(hidden, head_weight, previous_tokens)
+                return F.cross_entropy(logits.float(), targets, reduction="none")
+
+            checkpoint_args = (hidden_chunk, target_chunk, lm_head_weight)
+            if prev_chunk is not None:
+                checkpoint_args += (prev_chunk,)
+            if torch.is_grad_enabled() and hidden_chunk.requires_grad:
+                chunk_losses = checkpoint(
+                    chunk_loss, *checkpoint_args, use_reentrant=False
+                )
+            else:
+                chunk_losses = chunk_loss(*checkpoint_args)
+            losses.append(chunk_losses)
+        return torch.cat(losses, dim=0)
+
+    def _chunked_full_vocab_topk(
+        self,
+        *,
+        active_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        k: int,
+        active_prev_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        active_count = int(active_hidden.size(0))
+        topk = min(max(int(k), 1), int(lm_head_weight.size(0)))
+        token_chunks = []
+        for start in range(0, active_count, self.ce_token_chunk_size):
+            end = min(start + self.ce_token_chunk_size, active_count)
+            prev_chunk = (
+                active_prev_tokens[start:end]
+                if active_prev_tokens is not None
+                else None
+            )
+            logits = self._full_vocab_logits(
+                active_hidden[start:end], lm_head_weight, prev_chunk
+            )
+            token_chunks.append(logits.topk(topk, dim=-1).indices)
+        return torch.cat(token_chunks, dim=0)
 
     def forward(
         self,
@@ -408,9 +540,12 @@ class DFlashTrainingModel(nn.Module):
 
         sanitized_rows = torch.zeros((), dtype=torch.float32, device=device)
         local_ploss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        active_logits = None
+        restricted_vocab = None
+        finite_loss = torch.zeros_like(active_targets, dtype=torch.bool)
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
-        elif self.loss_mode in {"restricted_ce", "sampled_ce"}:
+        elif self.loss_mode == "sampled_ce":
             vocab_size = int(lm_head_weight.shape[0])
             restricted_vocab = self._build_restricted_vocab(
                 input_ids, active_targets, vocab_size
@@ -420,6 +555,24 @@ class DFlashTrainingModel(nn.Module):
             active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
             active_loss = F.cross_entropy(
                 active_logits, active_ce_targets, reduction="none"
+            )
+            finite_loss = torch.isfinite(active_loss)
+            sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
+            active_loss = torch.where(
+                finite_loss, active_loss, torch.zeros_like(active_loss)
+            )
+            active_loss_weights = active_weights * finite_loss.to(
+                dtype=active_weights.dtype
+            )
+            loss_per_token[active_mask] = active_loss
+            valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
+            local_ploss_sum = (active_loss * active_loss_weights).sum()
+            loss = local_ploss_sum / valid_token_count
+        elif self.loss_mode == "chunked_ce":
+            active_loss = self._chunked_exact_cross_entropy(
+                active_hidden=active_hidden,
+                active_targets=active_targets,
+                lm_head_weight=lm_head_weight,
             )
             finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
@@ -461,11 +614,22 @@ class DFlashTrainingModel(nn.Module):
             if active_targets.numel() > 0:
                 quality_mask = finite_loss
                 quality_token_count = quality_mask.float().sum()
-                if self.loss_mode in {"restricted_ce", "sampled_ce"}:
+                if self.loss_mode == "chunked_ce":
+                    active_topk = self._chunked_full_vocab_topk(
+                        active_hidden=active_hidden,
+                        lm_head_weight=lm_head_weight,
+                        k=5,
+                    )
+                    active_top1_ids = active_topk[:, 0]
+                    quality_topk = int(active_topk.size(-1))
+                elif self.loss_mode == "sampled_ce":
+                    assert restricted_vocab is not None
+                    assert active_logits is not None
                     active_top1_ids = restricted_vocab[
                         torch.argmax(active_logits, dim=-1)
                     ]
                 else:
+                    assert active_logits is not None
                     active_top1_ids = torch.argmax(active_logits, dim=-1)
                 active_pred_ids = active_top1_ids
                 correct[active_mask] = active_pred_ids == active_targets
@@ -475,11 +639,14 @@ class DFlashTrainingModel(nn.Module):
                         .float()
                         .sum()
                     )
-                    quality_topk = min(5, int(active_logits.size(-1)))
-                    if quality_topk > 1:
+                    if self.loss_mode != "chunked_ce":
+                        assert active_logits is not None
+                        quality_topk = min(5, int(active_logits.size(-1)))
                         active_topk = active_logits.topk(quality_topk, dim=-1).indices
-                        if self.loss_mode in {"restricted_ce", "sampled_ce"}:
+                        if self.loss_mode == "sampled_ce":
+                            assert restricted_vocab is not None
                             active_topk = restricted_vocab[active_topk]
+                    if quality_topk > 1:
                         top5_correct_count = (
                             (
                                 active_topk[quality_mask]
@@ -591,16 +758,17 @@ class DFlashTrainingModel(nn.Module):
                 "count_per_position": count_per_position,
                 "sampled_vocab_size": torch.tensor(
                     float(restricted_vocab.numel())
-                    if self.loss_mode in {"restricted_ce", "sampled_ce"}
-                    and active_targets.numel() > 0
+                    if restricted_vocab is not None
                     else float(lm_head_weight.shape[0]),
                     dtype=torch.float32,
                     device=device,
                 ),
                 "loss_mode_id": torch.tensor(
-                    {"full_vocab": 0.0, "restricted_ce": 1.0, "sampled_ce": 2.0}.get(
-                        self.loss_mode, 0.0
-                    ),
+                    {
+                        "full_vocab": 0.0,
+                        "sampled_ce": 2.0,
+                        "chunked_ce": 3.0,
+                    }.get(self.loss_mode, 0.0),
                     dtype=torch.float32,
                     device=device,
                 ),
@@ -899,6 +1067,12 @@ class DFlashTrainerBackend:
             normalized_state = self._normalize_draft_state_dict(
                 self._load_draft_state_dict(model_path)
             )
+        if not normalized_state:
+            raise ValueError(
+                "DFlash/DSpark checkpoint contains no model weights: "
+                f"model_path={model_path}. This checkpoint cannot be resumed; "
+                "restart the experiment from the original drafter model."
+            )
         required_backbone_keys = {"fc.weight", "hidden_norm.weight", "norm.weight"}
         missing_backbone_keys = sorted(
             required_backbone_keys.difference(normalized_state)
@@ -1000,6 +1174,7 @@ class DFlashTrainerBackend:
             sampled_ce_negatives=int(
                 training_cfg.get("dflash_sampled_ce_negatives", 0)
             ),
+            ce_token_chunk_size=int(training_cfg.get("dflash_ce_token_chunk_size", 64)),
         ), drafter_config
 
     def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):

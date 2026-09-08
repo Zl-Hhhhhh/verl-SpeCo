@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
 set -x
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 case "${LD_PRELOAD:-}" in
@@ -15,25 +17,33 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
-# algorithm as DSPARK and maps it to vLLM's dflash speculative method.
-project_name='verl_grpo_example_dspark_drafter'
-exp_name='qwen3_8b_dspark_drafter_vllm_npu'
+SPECO_PYTHON=${SPECO_PYTHON:-/workspace/main_env_next/bin/python}
+SPECO_RUNTIME_SETUP=${SPECO_RUNTIME_SETUP:-/workspace/main_env_next/bin/activate-speco-cann901-v1.sh}
+# shellcheck disable=SC1090
+source "${SPECO_RUNTIME_SETUP}"
 
-gen_tp=2
-train_sp=4
+# NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
+# algorithm as DSPARK and maps it to vLLM's native dspark speculative method.
+# Keep the base example aligned with the managed DFlash launcher: the common
+# entrypoint owns the dataset-specific project and the stable run name/group.
+project_name=${WANDB_PROJECT:-verl_grpo_example_dspark_drafter}
+exp_name=${WANDB_RUN_NAME:-qwen3_8b_dspark_drafter_vllm_npu}
+
+gen_tp=${GEN_TP_SIZE:-2}
+train_sp=${TRAIN_SP_SIZE:-4}
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen3-8B}
+CKPTS_DIR=${CKPTS_DIR:-/workspace/verl-SpeCo/outputs/dspark_qwen3_8b_block7}
+TRAIN_FILE=${TRAIN_FILE:-/workspace/data/gsm8k_smoke/train.parquet}
+TEST_FILE=${TEST_FILE:-/workspace/data/gsm8k_smoke/test.parquet}
+DRAFTER_PATH=${DRAFTER_PATH:-/workspace/models/dspark_qwen3_8b_block7}
+TRAINER_LOGGERS=${TRAINER_LOGGERS:-'["console","wandb"]'}
 
 
-PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
+PYTHONUNBUFFERED=1 "${SPECO_PYTHON}" -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     transfer_queue.enable=False \
     ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
@@ -53,7 +63,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -90,7 +100,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
     actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=chunked_ce \
     actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
@@ -120,7 +130,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.use_kl_in_reward=False \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console"]' \
+    trainer.logger="${TRAINER_LOGGERS}" \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \

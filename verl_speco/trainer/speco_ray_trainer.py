@@ -16,9 +16,12 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from types import MethodType
 from typing import Any, cast
 
@@ -27,6 +30,7 @@ import torch
 from omegaconf import open_dict
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs
+from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
@@ -69,7 +73,12 @@ from verl_speco.integration.sglang_runtime import (
 )
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
+    SPECO_VLLM_SPECULATIVE_TRACE_KEY,
+    SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY,
     configure_vllm_runtime_from_config,
+)
+from verl_speco.trainer.dspark_training_config import (
+    dspark_target_distribution_loss_enabled,
 )
 from verl_speco.workers import SpecoWorker
 
@@ -80,8 +89,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
     "drafter/spec_decode/mean_acceptance_length"
 )
+SPECO_KEY_METRIC_ALIASES = {
+    "key_metrics/mean_acceptance_length": SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC,
+    "key_metrics/generation_time_s": "timing_s/gen",
+    "key_metrics/step_time_s": "timing_s/step",
+    "key_metrics/critic_reward_mean": "critic/rewards/mean",
+}
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
+_SPECO_VALIDATION_SPEC_DECODE_PREFIX = "val-aux/drafter/spec_decode"
+_SPECO_VALIDATION_DIAGNOSTICS_DIR_ENV = "SPECO_VALIDATION_DIAGNOSTICS_DIR"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
@@ -93,6 +110,73 @@ _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     "/path/to/drafter/checkpoint",
 }
 _POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
+
+
+def speco_step_matches_save_schedule(
+    step: int, frequency: int, offset: int = 0
+) -> bool:
+    """Return whether ``step`` matches a positive periodic save schedule."""
+
+    try:
+        step = int(step)
+        frequency = int(frequency)
+        offset = int(offset)
+    except (TypeError, ValueError):
+        return False
+    if step <= 0 or frequency <= 0 or offset < 0 or offset >= frequency:
+        return False
+    return step >= frequency + offset and (step - offset) % frequency == 0
+
+
+def _speco_limit_drafter_resource_pool(
+    resource_pool: Any,
+    requested_world_size: Any,
+    rollout_config: Any,
+):
+    """Return the actor-pool prefix assigned to online drafter training."""
+
+    if requested_world_size is None:
+        return resource_pool
+    try:
+        requested_world_size = int(requested_world_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "drafter.training.worker_world_size must be an integer, "
+            f"got {requested_world_size!r}"
+        ) from exc
+
+    full_world_size = int(resource_pool.world_size)
+    rollout_world_size = math.prod(
+        int(_get_nested(rollout_config, (key,), 1) or 1)
+        for key in (
+            "tensor_model_parallel_size",
+            "data_parallel_size",
+            "pipeline_model_parallel_size",
+        )
+    )
+    if requested_world_size <= 0 or requested_world_size > full_world_size:
+        raise ValueError(
+            "drafter.training.worker_world_size must be in "
+            f"[1, {full_world_size}], got {requested_world_size}"
+        )
+    if requested_world_size % rollout_world_size != 0:
+        raise ValueError(
+            "drafter.training.worker_world_size must be divisible by the rollout replica world size: "
+            f"worker_world_size={requested_world_size}, rollout_world_size={rollout_world_size}"
+        )
+    if requested_world_size == full_world_size:
+        return resource_pool
+
+    limited_pool = split_resource_pool(
+        resource_pool,
+        split_size=[requested_world_size, full_world_size - requested_world_size],
+    )[0]
+    logger.warning(
+        "SPECO online drafter uses %s of %s actor resource-pool workers",
+        requested_world_size,
+        full_world_size,
+    )
+    return limited_pool
 
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
@@ -170,6 +254,19 @@ def _speco_metric_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _speco_add_key_metric_aliases(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    aliases = {
+        alias: value
+        for alias, source in SPECO_KEY_METRIC_ALIASES.items()
+        if (value := _speco_metric_float(data.get(source))) is not None
+    }
+    if not aliases:
+        return data
+    return {**data, **aliases}
 
 
 def _speco_move_drafter_timing_next_to_update_actor(data: Any) -> Any:
@@ -392,6 +489,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_collected_samples = 0
         self._speco_last_oldlogprob_collected_rows = 0
         self._speco_last_oldlogprob_payload_mib = 0.0
+        self._speco_last_oldlogprob_window_strata = {}
+        self._speco_last_oldlogprob_materialized_window_strata = {}
+        self._speco_last_oldlogprob_drop_reasons = {}
+        self._speco_last_oldlogprob_dispatched_samples = 0
+        self._speco_last_oldlogprob_consumed_samples = 0
+        self._speco_last_oldlogprob_unique_samples = 0
+        self._speco_last_oldlogprob_consumed_unique_samples = 0
+        self._speco_last_spec_trace_samples = 0
+        self._speco_last_spec_trace_verify_steps = 0
+        self._speco_last_spec_trace_draft_tokens = 0
+        self._speco_last_spec_trace_teacher_logprob_tokens = 0
+        self._speco_last_spec_trace_accepted_tokens = 0
+        self._speco_last_spec_trace_first_rejections = 0
+        self._speco_last_spec_trace_unverified_suffix_tokens = 0
+        self._speco_last_spec_trace_all_accepted_steps = 0
+        self._speco_last_spec_trace_diagnostics = {}
+        self._speco_last_fixed_eval_trace_metrics = {}
+        self._speco_last_drafter_guard_reason = ""
+        self._speco_pending_post_update_acceptance_guard = None
+        self._speco_pending_candidate_update = None
+        self._speco_pending_candidate_metrics = {}
+        self._speco_candidate_grad_norm_history = []
+        self._speco_best_candidate_score = None
+        self._speco_candidate_gate_cohort = None
+        self._speco_pending_best_candidate_save = None
+        self._speco_pending_dual_best_observation = None
+        self._speco_last_rollout_generation_elapsed_sec = 0.0
+        self._speco_last_rollout_response_tokens = 0
         self._speco_last_oldlogprob_select_elapsed_sec = 0.0
         self._speco_last_oldlogprob_sp_merge_elapsed_sec = 0.0
         self._speco_last_oldlogprob_concat_elapsed_sec = 0.0
@@ -437,14 +562,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_maybe_publish(self):
         return self._require_speco_worker_group().maybe_publish()
 
+    def speco_get_candidate_weights(self, global_step: int, alpha: float):
+        return self._require_speco_worker_group().get_candidate_weights(
+            global_step, alpha
+        )
+
+    def speco_finalize_candidate_update(self, global_step: int, alpha: float):
+        return self._require_speco_worker_group().finalize_candidate_update(
+            global_step, alpha
+        )
+
     def speco_save_checkpoint(
         self,
         global_step: int,
         wait: bool = True,
+        include_optimizer: bool = True,
     ):
         return self._require_speco_worker_group().save_checkpoint(
             global_step,
             wait=wait,
+            include_optimizer=include_optimizer,
         )
 
     def speco_wait_checkpoint(self):
@@ -552,6 +689,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             else Role.ActorRollout
         )
         resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        training_cfg = self._speco_drafter_training_config()
+        resource_pool = _speco_limit_drafter_resource_pool(
+            resource_pool,
+            training_cfg.get("worker_world_size", None),
+            self.config.actor_rollout_ref.rollout,
+        )
         drafter_cls = RayClassWithInitArgs(
             cls=speco_worker_cls,
             config=self.config.actor_rollout_ref,
@@ -702,6 +845,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not bool(resume_setting):
             return
 
+        explicit_resume_model_path = _get_nested(
+            drafter_cfg, ("resume_model_path",), None
+        )
+        if explicit_resume_model_path:
+            from verl_speco.trainer.checkpoint import (
+                get_drafter_checkpoint_step,
+                is_pretrained_drafter_checkpoint,
+            )
+
+            explicit_resume_model_path = os.path.realpath(
+                os.fspath(explicit_resume_model_path)
+            )
+            if not is_pretrained_drafter_checkpoint(explicit_resume_model_path):
+                raise RuntimeError(
+                    "Explicit drafter resume checkpoint is incomplete or invalid: "
+                    f"{explicit_resume_model_path}"
+                )
+            self._speco_set_config_value(
+                drafter_cfg, "model_path", explicit_resume_model_path
+            )
+            logger.warning(
+                "[drafter recovery] explicitly resuming checkpoint=%s drafter_step=%s",
+                explicit_resume_model_path,
+                get_drafter_checkpoint_step(explicit_resume_model_path),
+            )
+            return
+
         resume_step = self._speco_resume_global_step_hint()
         if resume_step is None:
             return
@@ -766,7 +936,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         cls, value: Any, *, require_saved: bool
     ) -> None:
         results = cls._speco_flatten_checkpoint_results(value)
-        allowed_skips = {"not_checkpoint_replica", "not_in_training_group"}
+        allowed_skips = {
+            "not_checkpoint_leader",
+            "not_checkpoint_replica",
+            "not_in_training_group",
+        }
         failures = [
             result
             for result in results
@@ -780,23 +954,48 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             raise RuntimeError(f"Drafter checkpoint produced no saved state: {results}")
 
-    def _speco_save_drafter_checkpoint(self, *, wait: bool = True):
+    def _speco_save_drafter_checkpoint(
+        self,
+        *,
+        wait: bool = True,
+        step: int | None = None,
+        include_optimizer: bool = True,
+    ):
         if not self._speco_should_save_drafter_checkpoint():
             return None
         if self._speco_ensure_drafter_checkpoint_path() is None:
             return None
+        checkpoint_step = int(self.global_steps if step is None else step)
         checkpoint_refs = self.speco_save_checkpoint(
-            self.global_steps,
+            checkpoint_step,
             wait=wait,
+            include_optimizer=include_optimizer,
         )
         if wait:
             results = self._ray_get_if_needed(checkpoint_refs)
             self._speco_validate_drafter_checkpoint_results(results, require_saved=True)
+            self._speco_last_saved_drafter_step = checkpoint_step
             return results
         if not hasattr(self, "_pending_drafter_checkpoint_refs"):
             self._pending_drafter_checkpoint_refs = []
         self._pending_drafter_checkpoint_refs.append(checkpoint_refs)
         return checkpoint_refs
+
+    def _speco_mark_final_drafter_checkpoint(self) -> str | None:
+        if not self._speco_should_save_drafter_checkpoint():
+            return None
+        checkpoint_root = self._speco_ensure_drafter_checkpoint_path()
+        if checkpoint_root is None:
+            return None
+        os.makedirs(checkpoint_root, exist_ok=True)
+        marker_path = os.path.join(
+            checkpoint_root, "final_checkpointed_iteration.txt"
+        )
+        temporary_path = f"{marker_path}.tmp.{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            stream.write(f"{int(self.global_steps)}\n")
+        os.replace(temporary_path, marker_path)
+        return marker_path
 
     def _speco_wait_pending_drafter_checkpoint(self) -> int:
         pending_refs = getattr(self, "_pending_drafter_checkpoint_refs", None)
@@ -847,6 +1046,78 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return False
         return bool(training_cfg.get("use_data_buffer", False))
 
+    def _speco_drafter_collection_guard(self) -> tuple[bool, str]:
+        """Reject a drafter update when collection transport is incomplete."""
+        if not self._speco_oldlogprob_collection_requested():
+            return True, "not_oldlogprob_collection"
+
+        training_cfg = self._speco_drafter_training_config()
+        planned = int(
+            getattr(self, "_speco_last_oldlogprob_planned_samples", 0) or 0
+        )
+        materialized = int(
+            getattr(self, "_speco_last_oldlogprob_collected_samples", 0) or 0
+        )
+        dispatched = int(
+            getattr(self, "_speco_last_oldlogprob_dispatched_samples", 0) or 0
+        )
+        consumed = int(
+            getattr(self, "_speco_last_oldlogprob_consumed_samples", 0) or 0
+        )
+        min_materialization = float(
+            training_cfg.get("oldlogprob_min_materialization_ratio", 0.95) or 0.0
+        )
+        min_consumption = float(
+            training_cfg.get("oldlogprob_min_consumption_ratio", 0.95) or 0.0
+        )
+        min_trace_coverage = float(
+            training_cfg.get("spec_trace_min_sample_coverage", 0.95) or 0.0
+        )
+        min_teacher_coverage = float(
+            training_cfg.get("spec_trace_min_teacher_logprob_coverage", 0.95) or 0.0
+        )
+
+        if planned > 0 and materialized / planned < min_materialization:
+            return False, "materialization_coverage"
+        if dispatched > 0 and consumed / dispatched < min_consumption:
+            return False, "worker_consumption_coverage"
+
+        diagnostics = getattr(self, "_speco_last_spec_trace_diagnostics", {}) or {}
+        selected_draft_tokens = int(
+            diagnostics.get("engine_scheduled_draft_tokens", 0) or 0
+        )
+        rollout_stats = (
+            getattr(self, "_speco_last_rollout_metrics", {}) or {}
+            if getattr(self, "_speco_last_rollout_metrics_step", None)
+            == getattr(self, "global_steps", None)
+            else {}
+        )
+        rollout_draft_tokens = int(
+            float(rollout_stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
+        )
+        speculative_decode_ran = selected_draft_tokens > 0 or rollout_draft_tokens > 0
+        trace_samples = int(getattr(self, "_speco_last_spec_trace_samples", 0) or 0)
+        trace_coverage = trace_samples / materialized if materialized > 0 else 0.0
+        if speculative_decode_ran and trace_coverage < min_trace_coverage:
+            return False, "spec_trace_coverage"
+        rejected_k3_alpha = float(
+            training_cfg.get("dspark_rejected_k3_alpha", 0.0) or 0.0
+        )
+        teacher_tokens = int(
+            getattr(self, "_speco_last_spec_trace_teacher_logprob_tokens", 0) or 0
+        )
+        draft_tokens = int(
+            getattr(self, "_speco_last_spec_trace_draft_tokens", 0) or 0
+        )
+        teacher_coverage = teacher_tokens / draft_tokens if draft_tokens > 0 else 0.0
+        if (
+            rejected_k3_alpha > 0
+            and speculative_decode_ran
+            and teacher_coverage < min_teacher_coverage
+        ):
+            return False, "spec_trace_teacher_logprob_coverage"
+        return True, "ok"
+
     def _speco_set_drafter_global_step(self, *, log_timing: bool = True):
         return self._ray_get_if_needed(self.speco_set_global_step(self.global_steps))
 
@@ -856,11 +1127,47 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not buckets or not any(bucket for bucket in buckets):
             return None
         rpc_started = time.perf_counter()
-        result = self.speco_collect_rollout_features(buckets)
+        dispatched = sum(len(bucket) for bucket in buckets)
+        result = self._ray_get_if_needed(
+            self.speco_collect_rollout_features(buckets)
+        )
         if source == "oldlogprob":
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = (
                 time.perf_counter() - rpc_started
             )
+            collection_results = self._speco_flatten_checkpoint_results(result)
+            consumed = sum(
+                int(item.get("stored_samples", 0) or 0)
+                for item in collection_results
+            )
+            consumed_ids = {
+                str(sample_id)
+                for item in collection_results
+                for sample_id in (item.get("sample_ids") or [])
+                if sample_id not in (None, "")
+            }
+            dispatched_ids = {
+                str(sample.get("sample_id"))
+                for bucket in buckets
+                for sample in bucket
+                if sample.get("sample_id") not in (None, "")
+            }
+            self._speco_last_oldlogprob_dispatched_samples = dispatched
+            self._speco_last_oldlogprob_consumed_samples = consumed
+            self._speco_last_oldlogprob_unique_samples = len(dispatched_ids)
+            self._speco_last_oldlogprob_consumed_unique_samples = len(consumed_ids)
+            missing_hidden = sum(
+                int(item.get("missing_hidden_samples", 0) or 0)
+                for item in collection_results
+            )
+            if missing_hidden:
+                drop_reasons = dict(
+                    getattr(self, "_speco_last_oldlogprob_drop_reasons", {})
+                )
+                drop_reasons["worker_missing_hidden"] = int(
+                    drop_reasons.get("worker_missing_hidden", 0)
+                ) + missing_hidden
+                self._speco_last_oldlogprob_drop_reasons = drop_reasons
         return result
 
     def _speco_oldlogprob_collection_requested(self) -> bool:
@@ -942,9 +1249,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
         ).upper()
         training_cfg = self._speco_drafter_training_config()
-        if (
-            algorithm == "DSPARK"
-            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        if algorithm == "DSPARK" and dspark_target_distribution_loss_enabled(
+            training_cfg
         ):
             return "dflash_aux_plus_last"
         return (
@@ -963,13 +1269,79 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     @staticmethod
     def _speco_oldlogprob_window_mode(training_cfg) -> str:
         mode = (
-            str(training_cfg.get("hidden_state_window_mode", "front") or "front")
+            str(
+                training_cfg.get("hidden_state_window_mode", "stratified")
+                or "stratified"
+            )
             .strip()
             .lower()
         )
-        if mode not in {"front", "random"}:
-            return "front"
+        if mode not in {"front", "random", "stratified"}:
+            return "stratified"
         return mode
+
+    @staticmethod
+    def _speco_oldlogprob_window_strata_weights(
+        training_cfg,
+    ) -> tuple[float, float, float]:
+        raw = training_cfg.get("hidden_state_window_strata_weights", [0.34, 0.33, 0.33])
+        if isinstance(raw, Mapping):
+            values = [raw.get(name, 0.0) for name in ("front", "middle", "tail")]
+        else:
+            try:
+                values = list(raw)
+            except TypeError:
+                values = []
+        if len(values) != 3:
+            values = [0.34, 0.33, 0.33]
+        weights = tuple(max(float(value or 0.0), 0.0) for value in values)
+        total = sum(weights)
+        if total <= 0:
+            return (1.0 / 3.0,) * 3
+        return tuple(value / total for value in weights)
+
+    @classmethod
+    def _speco_oldlogprob_stratified_window_offset(
+        cls,
+        *,
+        sample_key: str,
+        max_start_offset: int,
+        weights: tuple[float, float, float],
+        stratum_index: int | None = None,
+    ) -> tuple[int, str]:
+        if max_start_offset <= 0:
+            return 0, "full"
+        if stratum_index is None:
+            stratum_draw = cls._speco_hash_fraction(f"{sample_key}:window:stratum")
+            if stratum_draw < weights[0]:
+                stratum = 0
+            elif stratum_draw < weights[0] + weights[1]:
+                stratum = 1
+            else:
+                stratum = 2
+        else:
+            stratum = min(max(int(stratum_index), 0), 2)
+        num_offsets = max_start_offset + 1
+        start = (stratum * num_offsets + 2) // 3
+        end = ((stratum + 1) * num_offsets + 2) // 3
+        end = max(end, start + 1)
+        offset = start + cls._speco_hash_int(
+            f"{sample_key}:window:offset", end - start - 1
+        )
+        return min(offset, max_start_offset), ("front", "middle", "tail")[stratum]
+
+    @staticmethod
+    def _speco_next_oldlogprob_window_stratum(
+        assigned_counts: list[int], weights: tuple[float, float, float]
+    ) -> int:
+        next_total = sum(assigned_counts) + 1
+        return max(
+            range(3),
+            key=lambda index: (
+                next_total * weights[index] - assigned_counts[index],
+                -index,
+            ),
+        )
 
     @staticmethod
     def _speco_oldlogprob_aux_layer_ids_from_config(config) -> Any | None:
@@ -1127,6 +1499,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             inclusive_max + 1
         )
 
+    @classmethod
+    def _speco_sample_identity(
+        cls,
+        batch: DataProto,
+        batch_idx: int,
+        prompt_ids: torch.Tensor,
+    ) -> str:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", {}) or {}
+        external_id = None
+        for key in ("uid", "request_id", "rollout_id", "data_id", "index"):
+            external_id = cls._speco_sequence_item(non_tensor_batch.get(key), batch_idx)
+            if external_id not in (None, ""):
+                break
+        prompt_values = ",".join(
+            str(int(token_id)) for token_id in prompt_ids.detach().cpu().reshape(-1)
+        )
+        prompt_digest = hashlib.blake2b(
+            prompt_values.encode(), digest_size=12
+        ).hexdigest()
+        return f"{external_id or 'anonymous'}:{prompt_digest}"
+
     def _speco_build_oldlogprob_collect_plan(
         self, batch: DataProto
     ) -> dict[str, Any] | None:
@@ -1155,10 +1548,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         train_rows = self._speco_oldlogprob_window_train_rows(training_cfg)
         if train_rows <= 0:
             return None
-        hidden_rows = train_rows + 1
+        max_hidden_rows = train_rows + 1
         collect_mask = torch.zeros(batch_size, dtype=torch.bool)
-        hidden_positions = torch.zeros(batch_size, hidden_rows, dtype=torch.long)
-        hidden_position_mask = torch.zeros(batch_size, hidden_rows, dtype=torch.bool)
+        hidden_positions = torch.zeros(batch_size, max_hidden_rows, dtype=torch.long)
+        hidden_position_mask = torch.zeros(
+            batch_size, max_hidden_rows, dtype=torch.bool
+        )
         owner_rank = torch.zeros(batch_size, dtype=torch.long)
 
         owner_count = self._speco_owner_bucket_count()
@@ -1180,11 +1575,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         owner_token_counts = [0 for _ in range(owner_count)]
         seed_by_step = bool(training_cfg.get("hidden_state_random_seed_by_step", True))
         step_key = self.global_steps if seed_by_step else "request"
+        strata_weights = self._speco_oldlogprob_window_strata_weights(training_cfg)
 
         prompt_lens: list[int] = []
         response_lens: list[int] = []
         candidate_count = 0
         selected_count = 0
+        candidates: list[dict[str, Any]] = []
+        drop_reasons = {
+            "invalid_prompt_or_response": 0,
+            "sample_rate": 0,
+            "capacity": 0,
+        }
+        sample_ids = [None for _ in range(batch_size)]
+        fixed_eval_cohort = [False for _ in range(batch_size)]
+        fixed_eval_seed = int(training_cfg.get("fixed_eval_seed", 17) or 17)
+        fixed_eval_sample_rate = min(
+            max(float(training_cfg.get("fixed_eval_sample_rate", 0.1) or 0.0), 0.0),
+            1.0,
+        )
         for batch_idx in range(batch_size):
             prompt_len = int(
                 attention_mask[batch_idx, :prompt_width].detach().sum().item()
@@ -1197,36 +1606,115 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             prompt_lens.append(prompt_len)
             response_lens.append(response_len)
-            if prompt_len <= 0 or response_len < hidden_rows:
+            if prompt_len <= 0 or response_len <= 0:
+                drop_reasons["invalid_prompt_or_response"] += 1
                 continue
             candidate_count += 1
-            sample_key = f"{step_key}:{batch_idx}:{prompt_len}:{response_len}"
+            prompt_ids = prompts[batch_idx][
+                attention_mask[batch_idx, :prompt_width].bool()
+            ][:prompt_len]
+            stable_identity = self._speco_sample_identity(
+                batch, batch_idx, prompt_ids
+            )
+            sample_key = (
+                f"{step_key}:{batch_idx}:{stable_identity}:{prompt_len}:{response_len}"
+            )
+            sample_id = hashlib.blake2b(
+                f"{self.global_steps}:{batch_idx}:{stable_identity}:{response_len}".encode(),
+                digest_size=12,
+            ).hexdigest()
+            sample_ids[batch_idx] = sample_id
+            fixed_eval_cohort[batch_idx] = (
+                fixed_eval_sample_rate > 0
+                and self._speco_hash_fraction(
+                    f"{fixed_eval_seed}:{stable_identity}:fixed-eval"
+                )
+                < fixed_eval_sample_rate
+            )
             if (
                 sample_rate < 1.0
                 and self._speco_hash_fraction(sample_key) >= sample_rate
             ):
+                drop_reasons["sample_rate"] += 1
                 continue
-            owner = selected_count % owner_count
-            if owner_counts[owner] >= max_per_owner:
-                continue
-            if (
-                max_tokens_per_owner is not None
-                and owner_token_counts[owner] + hidden_rows > max_tokens_per_owner
-            ):
-                continue
+            hidden_rows = min(max_hidden_rows, response_len)
             max_start_offset = max(response_len - hidden_rows, 0)
+            window_stratum = window_mode
             if window_mode == "random":
                 random_offset = self._speco_hash_int(
                     f"{sample_key}:window", max_start_offset
                 )
+            elif window_mode == "stratified":
+                random_offset = 0
+                window_stratum = "full" if max_start_offset <= 0 else None
             else:
                 random_offset = 0
-            start = max(prompt_len - 1, 0) + random_offset
+            candidates.append(
+                {
+                    "priority": self._speco_hash_fraction(
+                        f"{sample_key}:collection-reservoir"
+                    ),
+                    "batch_idx": batch_idx,
+                    "hidden_rows": hidden_rows,
+                    "train_base": max(prompt_len - 1, 0),
+                    "start_offset": random_offset,
+                    "max_start_offset": max_start_offset,
+                    "sample_key": sample_key,
+                    "window_stratum": window_stratum,
+                }
+            )
+
+        window_strata = [None for _ in range(batch_size)]
+        assigned_strata = [0, 0, 0]
+        for candidate in sorted(
+            candidates, key=lambda item: (item["priority"], item["batch_idx"])
+        ):
+            batch_idx = int(candidate["batch_idx"])
+            hidden_rows = int(candidate["hidden_rows"])
+            eligible_owners = [
+                owner
+                for owner in range(owner_count)
+                if owner_counts[owner] < max_per_owner
+                and (
+                    max_tokens_per_owner is None
+                    or owner_token_counts[owner] + hidden_rows <= max_tokens_per_owner
+                )
+            ]
+            if not eligible_owners:
+                drop_reasons["capacity"] += 1
+                continue
+            owner = min(
+                eligible_owners,
+                key=lambda rank: (
+                    owner_counts[rank],
+                    owner_token_counts[rank],
+                    rank,
+                ),
+            )
+            start_offset = int(candidate["start_offset"])
+            window_stratum = candidate["window_stratum"]
+            if window_mode == "stratified" and int(
+                candidate["max_start_offset"]
+            ) > 0:
+                stratum_index = self._speco_next_oldlogprob_window_stratum(
+                    assigned_strata, strata_weights
+                )
+                start_offset, window_stratum = (
+                    self._speco_oldlogprob_stratified_window_offset(
+                        sample_key=str(candidate["sample_key"]),
+                        max_start_offset=int(candidate["max_start_offset"]),
+                        weights=strata_weights,
+                        stratum_index=stratum_index,
+                    )
+                )
+                assigned_strata[stratum_index] += 1
+            start = int(candidate["train_base"]) + start_offset
             positions = torch.arange(start, start + hidden_rows, dtype=torch.long)
             collect_mask[batch_idx] = True
-            hidden_positions[batch_idx, :] = positions
-            hidden_position_mask[batch_idx, :] = True
+            hidden_positions[batch_idx, :hidden_rows] = positions
+            hidden_position_mask[batch_idx, :hidden_rows] = True
             owner_rank[batch_idx] = owner
+            window_strata[batch_idx] = window_stratum
             owner_counts[owner] += 1
             owner_token_counts[owner] += hidden_rows
             selected_count += 1
@@ -1234,6 +1722,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
         self._speco_last_oldlogprob_planned_samples = selected_count
+        self._speco_last_oldlogprob_drop_reasons = drop_reasons
+        self._speco_last_oldlogprob_window_strata = {
+            str(stratum): sum(item == stratum for item in window_strata)
+            for stratum in {item for item in window_strata if item is not None}
+        }
         if selected_count <= 0:
             return None
         return {
@@ -1243,13 +1736,60 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "owner_rank": owner_rank,
             "prompt_lens": prompt_lens,
             "response_lens": response_lens,
-            "hidden_rows": hidden_rows,
+            "hidden_rows": max_hidden_rows,
             "owner_count": owner_count,
             "selected_count": selected_count,
             "candidate_count": candidate_count,
             "owner_token_counts": owner_token_counts,
             "window_mode": window_mode,
+            "window_strata": window_strata,
+            "sample_ids": sample_ids,
+            "fixed_eval_cohort": fixed_eval_cohort,
         }
+
+    def _speco_export_fixed_eval_snapshot(self, batch, collect_plan):
+        training_cfg = self._speco_drafter_training_config()
+        export_steps = training_cfg.get("fixed_eval_export_steps") or []
+        step = int(self.global_steps)
+        if step not in {int(value) for value in export_steps}:
+            return
+        from verl_speco.trainer.fixed_eval_snapshot import export_fixed_eval_snapshot
+
+        experiment_id = str(_get_nested(self.config, ("trainer", "experiment_name"), "unknown"))
+        run_id = os.getenv("WANDB_RUN_ID") or "no_wandb"
+        checkpoint_root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+        if not checkpoint_root:
+            raise ValueError("Fixed eval export requires trainer.default_local_dir")
+        actor_checkpoint = os.path.join(checkpoint_root, f"global_step_{step - 1}", "actor")
+        if step == 1:
+            actor_checkpoint = _get_nested(self.config, ("actor_rollout_ref", "model", "path"), "")
+        root = training_cfg.get("fixed_eval_export_dir") or os.path.join(
+            "outputs", "drafter_analysis", experiment_id, run_id, "fixed_eval_samples"
+        )
+        started = time.perf_counter()
+        manifest = export_fixed_eval_snapshot(
+            batch, collect_mask=collect_plan["collect_mask"], root=root, step=step,
+            sample_count=int(training_cfg.get("fixed_eval_export_samples", 128)),
+            seed=int(training_cfg.get("fixed_eval_export_seed", 17)),
+            actor_checkpoint=actor_checkpoint, experiment_id=experiment_id, run_id=run_id,
+            rollout_config={
+                "temperature": _get_nested(self.config, ("actor_rollout_ref", "rollout", "temperature"), None),
+                "top_p": _get_nested(self.config, ("actor_rollout_ref", "rollout", "top_p"), None),
+                "top_k": _get_nested(self.config, ("actor_rollout_ref", "rollout", "top_k"), None),
+                "max_response_length": _get_nested(self.config, ("data", "max_response_length"), None),
+                "draft_attention": _get_nested(self.config, ("actor_rollout_ref", "rollout", "drafter", "vllm", "dspark_attention_mode"), "full"),
+            },
+        )
+        self._speco_fixed_eval_export_metrics = {
+            "drafter/fixed_export/samples": manifest["sample_count"],
+            "drafter/fixed_export/unique_prompts": manifest["unique_prompts"],
+            "drafter/fixed_export/actor_snapshot_step": manifest["actor_snapshot_step"],
+            "timing_s/drafter_fixed_eval_export": time.perf_counter() - started,
+        }
+        logger.warning(
+            "[SPECO fixed eval] rollout_step=%s actor_step=%s samples=%s prompts=%s directory=%s",
+            step, step - 1, manifest["sample_count"], manifest["unique_prompts"], root,
+        )
 
     @staticmethod
     def _speco_tensor_rows(tensor: torch.Tensor | None) -> list[torch.Tensor]:
@@ -1267,6 +1807,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return None
         if isinstance(value, (list, tuple)):
             return value[index] if 0 <= index < len(value) else None
+        if not isinstance(value, (str, bytes, dict, torch.Tensor)):
+            try:
+                return value[index] if 0 <= index < len(value) else None
+            except (IndexError, KeyError, TypeError):
+                return None
         return None
 
     @staticmethod
@@ -1351,14 +1896,45 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         response_mask_tensor = batch.batch.get("response_mask", None)
         collect_mask = collect_plan["collect_mask"]
         hidden_positions = collect_plan["hidden_positions"]
+        hidden_position_mask = collect_plan["hidden_position_mask"]
         owner_rank = collect_plan["owner_rank"]
         prompt_lens = collect_plan["prompt_lens"]
         response_lens = collect_plan["response_lens"]
+        window_strata = collect_plan.get("window_strata") or []
+        sample_ids = collect_plan.get("sample_ids") or []
+        fixed_eval_cohort = collect_plan.get("fixed_eval_cohort") or []
+        non_tensor_batch = getattr(batch, "non_tensor_batch", {})
+        speculative_traces = non_tensor_batch.get(SPECO_VLLM_SPECULATIVE_TRACE_KEY)
+        speculative_trace_diagnostics = non_tensor_batch.get(
+            SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY
+        )
         buckets: list[list[dict[str, Any]]] = [
             [] for _ in range(int(collect_plan["owner_count"]))
         ]
         collected_rows = 0
         payload_bytes = 0
+        trace_samples = 0
+        trace_verify_steps = 0
+        trace_draft_tokens = 0
+        trace_teacher_logprob_tokens = 0
+        trace_accepted_tokens = 0
+        trace_first_rejections = 0
+        trace_unverified_suffix_tokens = 0
+        trace_all_accepted_steps = 0
+        trace_diagnostics_totals: dict[str, int] = {}
+        materialized_strata: dict[str, int] = {}
+        materialize_drop_reasons = {
+            "invalid_positions": 0,
+            "missing_hidden": 0,
+        }
+        fixed_trace_samples = 0
+        fixed_trace_verify_steps = 0
+        fixed_trace_draft_tokens = 0
+        fixed_trace_accepted_tokens = 0
+        fixed_trace_first_rejections = 0
+        fixed_trace_unverified_suffix_tokens = 0
+        fixed_trace_all_accepted_steps = 0
+        fixed_materialized_samples = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
         if isinstance(chunk_refs, (list, tuple)) and isinstance(
             chunk_meta, (list, tuple)
@@ -1411,9 +1987,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 continue
             prompt_len = int(prompt_lens[batch_idx])
             response_len = int(response_lens[batch_idx])
-            valid_positions = hidden_positions[batch_idx].reshape(-1)
+            position_mask = hidden_position_mask[batch_idx].reshape(-1).bool()
+            valid_positions = hidden_positions[batch_idx].reshape(-1)[position_mask]
             valid_rows = int(valid_positions.numel())
             if valid_rows <= 0:
+                materialize_drop_reasons["invalid_positions"] += 1
                 continue
             hidden_ref = self._speco_sequence_item(hidden_refs, batch_idx)
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
@@ -1431,9 +2009,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             elif hidden_ref is None:
                 if hidden is None:
+                    materialize_drop_reasons["missing_hidden"] += 1
                     continue
                 hidden = hidden[:valid_rows].contiguous()
                 if hidden.numel() == 0:
+                    materialize_drop_reasons["missing_hidden"] += 1
                     continue
                 collected_rows += int(hidden.size(0))
                 payload_bytes += int(hidden.numel()) * int(hidden.element_size())
@@ -1464,6 +2044,79 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "global_step": self.global_steps,
                 "replica_rank": owner,
             }
+            if batch_idx < len(sample_ids) and sample_ids[batch_idx] is not None:
+                sample["sample_id"] = str(sample_ids[batch_idx])
+            is_fixed_sample = bool(
+                batch_idx < len(fixed_eval_cohort) and fixed_eval_cohort[batch_idx]
+            )
+            if is_fixed_sample:
+                fixed_materialized_samples += 1
+            if batch_idx < len(window_strata):
+                sample["hidden_window_stratum"] = window_strata[batch_idx]
+                stratum = str(window_strata[batch_idx] or "unknown")
+                materialized_strata[stratum] = materialized_strata.get(stratum, 0) + 1
+            speculative_trace = self._speco_sequence_item(speculative_traces, batch_idx)
+            trace_diagnostics = self._speco_sequence_item(
+                speculative_trace_diagnostics, batch_idx
+            )
+            if speculative_trace is not None:
+                sample[SPECO_VLLM_SPECULATIVE_TRACE_KEY] = speculative_trace
+            if isinstance(trace_diagnostics, dict):
+                sample[SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY] = (
+                    trace_diagnostics
+                )
+                for key, value in trace_diagnostics.items():
+                    try:
+                        trace_diagnostics_totals[str(key)] = int(
+                            trace_diagnostics_totals.get(str(key), 0)
+                        ) + int(value or 0)
+                    except (TypeError, ValueError):
+                        continue
+            if isinstance(speculative_trace, (list, tuple)) and speculative_trace:
+                trace_samples += 1
+                if is_fixed_sample:
+                    fixed_trace_samples += 1
+                for event in speculative_trace:
+                    if not isinstance(event, dict):
+                        continue
+                    trace_verify_steps += 1
+                    if is_fixed_sample:
+                        fixed_trace_verify_steps += 1
+                    try:
+                        event_drafts = int(event.get("draft_count", 0) or 0)
+                        event_accepted = min(
+                            max(int(event.get("accepted_count", 0) or 0), 0),
+                            max(event_drafts, 0),
+                        )
+                        trace_draft_tokens += event_drafts
+                        teacher_logprobs = event.get("draft_teacher_logprobs")
+                        if isinstance(teacher_logprobs, (list, tuple)):
+                            trace_teacher_logprob_tokens += sum(
+                                1
+                                for value in teacher_logprobs[: max(event_drafts, 0)]
+                                if isinstance(value, (int, float))
+                                and math.isfinite(float(value))
+                            )
+                        trace_accepted_tokens += event_accepted
+                        if event_accepted < event_drafts:
+                            trace_first_rejections += 1
+                            trace_unverified_suffix_tokens += max(
+                                event_drafts - event_accepted - 1, 0
+                            )
+                        else:
+                            trace_all_accepted_steps += 1
+                        if is_fixed_sample:
+                            fixed_trace_draft_tokens += event_drafts
+                            fixed_trace_accepted_tokens += event_accepted
+                            if event_accepted < event_drafts:
+                                fixed_trace_first_rejections += 1
+                                fixed_trace_unverified_suffix_tokens += max(
+                                    event_drafts - event_accepted - 1, 0
+                                )
+                            else:
+                                fixed_trace_all_accepted_steps += 1
+                    except (TypeError, ValueError):
+                        continue
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
@@ -1476,6 +2129,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         collected = sum(len(bucket) for bucket in buckets)
         if collected <= 0:
+            planned_drop_reasons = dict(
+                getattr(self, "_speco_last_oldlogprob_drop_reasons", {})
+            )
+            for key, value in materialize_drop_reasons.items():
+                planned_drop_reasons[key] = int(
+                    planned_drop_reasons.get(key, 0)
+                ) + int(value)
+            self._speco_last_oldlogprob_drop_reasons = planned_drop_reasons
             return 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
         if dispatch_bucket_count is not None and dispatch_bucket_count > len(buckets):
@@ -1486,6 +2147,39 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_collected_samples = collected
         self._speco_last_oldlogprob_collected_rows = collected_rows
         self._speco_last_oldlogprob_payload_mib = payload_bytes / float(1024 * 1024)
+        self._speco_last_oldlogprob_materialized_window_strata = materialized_strata
+        planned_drop_reasons = dict(
+            getattr(self, "_speco_last_oldlogprob_drop_reasons", {})
+        )
+        for key, value in materialize_drop_reasons.items():
+            planned_drop_reasons[key] = int(planned_drop_reasons.get(key, 0)) + int(
+                value
+            )
+        self._speco_last_oldlogprob_drop_reasons = planned_drop_reasons
+        self._speco_last_spec_trace_samples = trace_samples
+        self._speco_last_spec_trace_verify_steps = trace_verify_steps
+        self._speco_last_spec_trace_draft_tokens = trace_draft_tokens
+        self._speco_last_spec_trace_teacher_logprob_tokens = (
+            trace_teacher_logprob_tokens
+        )
+        self._speco_last_spec_trace_accepted_tokens = trace_accepted_tokens
+        self._speco_last_spec_trace_first_rejections = trace_first_rejections
+        self._speco_last_spec_trace_unverified_suffix_tokens = (
+            trace_unverified_suffix_tokens
+        )
+        self._speco_last_spec_trace_all_accepted_steps = trace_all_accepted_steps
+        self._speco_last_spec_trace_diagnostics = trace_diagnostics_totals
+        self._speco_last_fixed_eval_trace_metrics = {
+            "materialized_samples": fixed_materialized_samples,
+            "samples": fixed_trace_samples,
+            "verify_steps": fixed_trace_verify_steps,
+            "draft_tokens": fixed_trace_draft_tokens,
+            "accepted_tokens": fixed_trace_accepted_tokens,
+            "first_rejections": fixed_trace_first_rejections,
+            "unverified_suffix_tokens": fixed_trace_unverified_suffix_tokens,
+            "all_accepted_steps": fixed_trace_all_accepted_steps,
+            "actor_snapshot_step": int(self.global_steps),
+        }
         return collected
 
     def _speco_num_rollout_replicas(self, samples: list[dict]) -> int:
@@ -1587,9 +2281,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         algorithm = str(
             _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
         ).upper()
-        if (
-            algorithm == "DSPARK"
-            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        if algorithm == "DSPARK" and dspark_target_distribution_loss_enabled(
+            training_cfg
         ):
             return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):
@@ -1823,6 +2516,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
+        passthrough_prefixes = ("dflash/", "dspark/", "domino/", "drafter/")
+        passthrough_keys = {
+            key
+            for result in normalized_results
+            for key, value in result.items()
+            if key.startswith(passthrough_prefixes)
+            and not key.startswith("timing_s/")
+            and _speco_metric_float(value) is not None
+        }
+        for key in sorted(passthrough_keys):
+            values = [
+                value
+                for result in normalized_results
+                if (value := _speco_metric_float(result.get(key))) is not None
+            ]
+            if not values:
+                continue
+            if key.startswith("drafter/"):
+                metric_key = key
+            else:
+                metric_key = f"drafter/train/{key.replace('/', '_')}"
+            if key in {
+                "drafter/k3_dump_files",
+                "drafter/k3_dump_tokens",
+                "drafter/k3_dump_failures",
+            }:
+                metrics[metric_key] = sum(values)
+            elif key.endswith(("accepted_k3_min", "rejected_k3_min")):
+                metrics[metric_key] = min(values)
+            else:
+                metrics[metric_key] = max(values)
         metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
         return trained, metrics
 
@@ -1870,6 +2594,658 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_get_published_drafter_weights(self):
         published = self._ray_get_if_needed(self.speco_maybe_publish()) or []
         return self._first_non_null(published)
+
+    def _speco_candidate_gate_enabled(self) -> bool:
+        return bool(
+            self._speco_drafter_training_config().get(
+                "candidate_gate_enabled", False
+            )
+        )
+
+    def _speco_candidate_alphas(self) -> tuple[float, ...]:
+        configured = self._speco_drafter_training_config().get(
+            "candidate_gate_alphas", [0.0, 0.25, 0.5, 1.0]
+        )
+        if isinstance(configured, str):
+            configured = configured.split(",")
+        try:
+            values = [float(value) for value in configured]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate_gate_alphas must be a list of numbers") from exc
+        values.append(0.0)
+        normalized = sorted(
+            {value for value in values if math.isfinite(value) and 0.0 <= value <= 1.0}
+        )
+        if not normalized:
+            raise ValueError("candidate_gate_alphas must contain a value in [0, 1]")
+        return tuple(normalized)
+
+    def _speco_publish_candidate_alpha(self, update_step: int, alpha: float) -> float:
+        fetch_started = time.perf_counter()
+        payloads = self._ray_get_if_needed(
+            self.speco_get_candidate_weights(update_step, alpha)
+        ) or []
+        published = self._first_non_null(payloads)
+        if published is None:
+            raise RuntimeError(
+                f"Missing drafter candidate state for step={update_step}, alpha={alpha}"
+            )
+        payload = resolve_drafter_publish_payload(published)
+        update_draft_weights = self._speco_actor_rollout_method(
+            "update_draft_weights"
+        )
+        self._ray_get_if_needed(
+            update_draft_weights(payload, global_steps=update_step)
+        )
+        return time.perf_counter() - fetch_started
+
+    def _speco_finalize_candidate(self, update_step: int, alpha: float) -> None:
+        results = self._ray_get_if_needed(
+            self.speco_finalize_candidate_update(update_step, alpha)
+        )
+        flattened = self._speco_flatten_checkpoint_results(results)
+        failed = [
+            item
+            for item in flattened
+            if item.get("reason") != "not_in_training_group"
+            and not bool(item.get("finalized", False))
+        ]
+        if failed:
+            raise RuntimeError(
+                f"Failed to finalize drafter candidate step={update_step}: {failed}"
+            )
+
+    @staticmethod
+    def _speco_candidate_response_tokens(output: Any) -> int:
+        batch = getattr(output, "batch", None)
+        if batch is None:
+            return 0
+        for key in ("response_mask", "loss_mask"):
+            try:
+                value = batch.get(key)
+            except (AttributeError, KeyError):
+                value = None
+            if torch.is_tensor(value):
+                return int(value.detach().sum().cpu().item())
+        try:
+            responses = batch.get("responses")
+        except (AttributeError, KeyError):
+            responses = None
+        return int(responses.numel()) if torch.is_tensor(responses) else 0
+
+    def _speco_candidate_gate_batch(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        source = None
+        source_arg = None
+        for index, value in enumerate(args):
+            if isinstance(value, DataProto):
+                source = value
+                source_arg = index
+                break
+        source_key = None
+        if source is None:
+            for key in ("batch", "prompts", "data", "input_batch"):
+                if isinstance(kwargs.get(key), DataProto):
+                    source = kwargs[key]
+                    source_key = key
+                    break
+        if source is None:
+            raise RuntimeError(
+                "Cannot locate DataProto input for candidate rollout gate"
+            )
+        configured_samples = int(
+            self._speco_drafter_training_config().get(
+                "candidate_gate_samples", 16
+            )
+            or 16
+        )
+        cohort = self._speco_candidate_gate_cohort
+        if cohort is None:
+            count = min(max(configured_samples, 1), len(source))
+            cohort = source[:count]
+            self._speco_candidate_gate_cohort = cohort
+        gate_batch = cohort[:]
+        gate_batch.meta_info = dict(getattr(source, "meta_info", {}) or {})
+        gate_batch.meta_info.update(
+            {
+                "validate": True,
+                "speco_candidate_gate": True,
+                "speco_candidate_gate_max_tokens": int(
+                    self._speco_drafter_training_config().get(
+                        "candidate_gate_max_tokens", 256
+                    )
+                    or 256
+                ),
+            }
+        )
+        gate_args = list(args)
+        gate_kwargs = dict(kwargs)
+        if source_arg is not None:
+            gate_args[source_arg] = gate_batch
+        else:
+            gate_kwargs[source_key] = gate_batch
+        return tuple(gate_args), gate_kwargs
+
+    def _speco_measure_candidate_rollout(
+        self, generate: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[Any, dict[str, float]]:
+        started = time.perf_counter()
+        output = generate(*args, **kwargs)
+        elapsed = time.perf_counter() - started
+        metrics = _speco_vllm_spec_decode_metrics_from_batch(output)
+        acceptance = _speco_metric_float(
+            metrics.get(SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC)
+        )
+        if acceptance is None:
+            raise RuntimeError("Candidate rollout produced no speculative decode stats")
+        response_tokens = self._speco_candidate_response_tokens(output)
+        return output, {
+            "acceptance": acceptance,
+            "elapsed_sec": elapsed,
+            "response_tokens": float(response_tokens),
+            "ms_per_token": (
+                elapsed * 1000.0 / response_tokens
+                if response_tokens > 0
+                else float("inf")
+            ),
+        }
+
+    def _speco_candidate_precheck(
+        self, train_metrics: Mapping[str, Any]
+    ) -> tuple[bool, str, dict[str, float | int]]:
+        cfg = self._speco_drafter_training_config()
+        checks = (
+            (
+                "fixed_loss",
+                "drafter/fixed_cohort/delta_loss",
+                float(cfg.get("candidate_max_fixed_loss_delta", 0.0) or 0.0),
+            ),
+            (
+                "rejected_k3_clamp",
+                "drafter/train/dspark_rejected_k3_clamp_ratio",
+                float(cfg.get("candidate_max_rejected_k3_clamp_ratio", 0.5) or 0.5),
+            ),
+            (
+                "rejected_k3_median",
+                "drafter/train/dspark_rejected_k3_median",
+                float(cfg.get("candidate_max_rejected_k3_median", 9.5) or 9.5),
+            ),
+        )
+        metrics: dict[str, float | int] = {}
+        for reason, key, maximum in checks:
+            value = _speco_metric_float(train_metrics.get(key))
+            if value is not None:
+                metrics[f"drafter/candidate/precheck_{reason}"] = value
+                if value > maximum:
+                    return False, reason, metrics
+
+        grad_norm = _speco_metric_float(train_metrics.get("drafter/train_grad_norm"))
+        if grad_norm is not None:
+            history = self._speco_candidate_grad_norm_history
+            fixed_max = float(cfg.get("candidate_max_grad_norm", 50.0) or 50.0)
+            rolling_multiplier = float(
+                cfg.get("candidate_grad_norm_rolling_multiplier", 5.0) or 5.0
+            )
+            rolling_median = (
+                float(torch.tensor(history[-5:]).median().item()) if history else None
+            )
+            metrics["drafter/candidate/precheck_grad_norm"] = grad_norm
+            if rolling_median is not None:
+                metrics["drafter/candidate/grad_norm_rolling_median"] = rolling_median
+            history.append(grad_norm)
+            del history[:-20]
+            if grad_norm > fixed_max or (
+                rolling_median is not None
+                and rolling_median > 0.0
+                and grad_norm > rolling_median * rolling_multiplier
+            ):
+                return False, "grad_norm", metrics
+        return True, "ok", metrics
+
+    def _speco_stage_candidate_update(
+        self, drafter_trained: bool, train_metrics: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if not self._speco_should_publish_drafter_weights(drafter_trained):
+            return {"drafter/candidate/staged": 0}
+        baseline = _speco_metric_float(
+            self._speco_current_step_rollout_metrics().get(
+                SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC
+            )
+        )
+        passed, reason, metrics = self._speco_candidate_precheck(train_metrics)
+        metrics.update(
+            {
+                "drafter/candidate/staged": int(passed),
+                "drafter/candidate/precheck_passed": int(passed),
+            }
+        )
+        if not passed:
+            self._speco_finalize_candidate(int(self.global_steps), 0.0)
+            metrics["drafter/candidate/rejected_pre_publish"] = 1
+            logger.warning(
+                "Rejected drafter candidate before rollout: step=%s reason=%s",
+                self.global_steps,
+                reason,
+            )
+            return metrics
+        self._speco_pending_candidate_update = {
+            "update_step": int(self.global_steps),
+            "full_baseline": baseline,
+        }
+        return metrics
+
+    def _speco_select_candidate_with_rollout(
+        self,
+        generate: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[float, dict[str, Any]]:
+        pending = self._speco_pending_candidate_update
+        update_step = int(pending["update_step"])
+        gate_args, gate_kwargs = self._speco_candidate_gate_batch(args, kwargs)
+        results = {}
+        metrics: dict[str, Any] = {"drafter/candidate/gate_ran": 1}
+        for alpha in self._speco_candidate_alphas():
+            publish_elapsed = self._speco_publish_candidate_alpha(update_step, alpha)
+            _, result = self._speco_measure_candidate_rollout(
+                generate, gate_args, gate_kwargs
+            )
+            results[alpha] = result
+            label = str(alpha).replace(".", "_")
+            metrics[f"drafter/candidate/alpha_{label}_acceptance"] = result[
+                "acceptance"
+            ]
+            metrics[f"drafter/candidate/alpha_{label}_ms_per_token"] = result[
+                "ms_per_token"
+            ]
+            metrics[f"timing_s/drafter_candidate_alpha_{label}_publish"] = (
+                publish_elapsed
+            )
+
+        baseline = results[0.0]
+        min_delta = float(
+            self._speco_drafter_training_config().get(
+                "candidate_gate_min_acceptance_delta", 0.0
+            )
+            or 0.0
+        )
+        max_latency_regression = float(
+            self._speco_drafter_training_config().get(
+                "candidate_gate_max_ms_per_token_regression", 0.15
+            )
+            or 0.15
+        )
+        selected = 0.0
+        selected_result = baseline
+        for alpha in self._speco_candidate_alphas():
+            if alpha == 0.0:
+                continue
+            candidate = results[alpha]
+            acceptance_ok = (
+                candidate["acceptance"]
+                >= baseline["acceptance"] + min_delta
+            )
+            latency_ok = (
+                not math.isfinite(baseline["ms_per_token"])
+                or candidate["ms_per_token"]
+                <= baseline["ms_per_token"] * (1.0 + max_latency_regression)
+            )
+            if not acceptance_ok or not latency_ok:
+                continue
+            if candidate["acceptance"] > selected_result["acceptance"] + 1e-12 or (
+                abs(candidate["acceptance"] - selected_result["acceptance"]) <= 1e-12
+                and candidate["ms_per_token"] < selected_result["ms_per_token"]
+            ):
+                selected = alpha
+                selected_result = candidate
+        if selected != self._speco_candidate_alphas()[-1]:
+            self._speco_publish_candidate_alpha(update_step, selected)
+        metrics["drafter/candidate/selected_alpha"] = selected
+        metrics["drafter/candidate/selected_gate_acceptance"] = selected_result[
+            "acceptance"
+        ]
+        metrics["drafter/candidate/gate_acceptance_delta"] = (
+            selected_result["acceptance"] - baseline["acceptance"]
+        )
+        return selected, metrics
+
+    def _speco_best_candidate_manifest_path(self) -> str | None:
+        checkpoint_root = self._speco_ensure_drafter_checkpoint_path()
+        if checkpoint_root is None:
+            return None
+        return os.path.join(checkpoint_root, "best_candidate.json")
+
+    def _speco_load_best_candidate_score(self) -> float:
+        if self._speco_best_candidate_score is not None:
+            return float(self._speco_best_candidate_score)
+        score = float("-inf")
+        path = self._speco_best_candidate_manifest_path()
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    score = float(json.load(stream).get("mean_acceptance_length"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Ignoring invalid best drafter manifest: %s", path)
+        self._speco_best_candidate_score = score
+        return score
+
+    def _speco_maybe_save_best_candidate(
+        self, *, update_step: int, alpha: float, observed: float
+    ) -> dict[str, Any]:
+        if not bool(
+            self._speco_drafter_training_config().get(
+                "save_best_drafter_checkpoint", True
+            )
+        ):
+            return {"drafter/candidate/best_saved": 0}
+        if not self._speco_should_save_drafter_checkpoint():
+            return {"drafter/candidate/best_saved": 0}
+        previous = self._speco_load_best_candidate_score()
+        min_delta = float(
+            self._speco_drafter_training_config().get(
+                "best_checkpoint_min_acceptance_delta", 0.0
+            )
+            or 0.0
+        )
+        if observed <= previous + min_delta:
+            return {"drafter/candidate/best_saved": 0}
+        save_started = time.perf_counter()
+        self._speco_save_drafter_checkpoint(wait=True, step=update_step)
+        save_elapsed = time.perf_counter() - save_started
+        path = self._speco_best_candidate_manifest_path()
+        if path is None:
+            return {"drafter/candidate/best_saved": 0}
+        record = {
+            "schema_version": 1,
+            "step": int(update_step),
+            "alpha": float(alpha),
+            "mean_acceptance_length": float(observed),
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.write("\n")
+        os.replace(temporary, path)
+        marker = os.path.join(os.path.dirname(path), "best_checkpointed_iteration.txt")
+        temporary_marker = f"{marker}.tmp.{os.getpid()}"
+        with open(temporary_marker, "w", encoding="utf-8") as stream:
+            stream.write(f"{int(update_step)}\n")
+        os.replace(temporary_marker, marker)
+        self._speco_best_candidate_score = float(observed)
+        return {
+            "drafter/candidate/best_saved": 1,
+            "drafter/candidate/best_score": float(observed),
+            "drafter/candidate/best_step": int(update_step),
+            "timing_s/drafter_best_checkpoint": save_elapsed,
+        }
+
+    def _speco_dual_metric_best_enabled(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        return bool(
+            training_cfg.get("dual_metric_best_checkpoint_enabled", False)
+        ) and bool(training_cfg.get("save_best_drafter_checkpoint", True)) and bool(
+            self._speco_drafter_checkpoint_save_config_enabled()
+        )
+
+    def _speco_dual_best_manifest_path(self, kind: str) -> str | None:
+        if kind not in {"acceptance", "throughput"}:
+            raise ValueError(f"Unsupported dual-best metric: {kind}")
+        checkpoint_root = self._speco_ensure_drafter_checkpoint_path()
+        if checkpoint_root is None:
+            return None
+        return os.path.join(checkpoint_root, f"best_{kind}.json")
+
+    def _speco_load_dual_best_score(self, kind: str) -> float:
+        path = self._speco_dual_best_manifest_path(kind)
+        if path is None or not os.path.isfile(path):
+            return float("-inf")
+        score_key = (
+            "mean_acceptance_length"
+            if kind == "acceptance"
+            else "response_tokens_per_second"
+        )
+        try:
+            with open(path, encoding="utf-8") as stream:
+                score = float(json.load(stream).get(score_key))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("Ignoring invalid dual-best drafter manifest: %s", path)
+            return float("-inf")
+        return score if math.isfinite(score) else float("-inf")
+
+    def _speco_has_complete_drafter_checkpoint(self, step: int) -> bool:
+        checkpoint_root = self._speco_ensure_drafter_checkpoint_path()
+        if checkpoint_root is None:
+            return False
+        checkpoint_path = os.path.join(checkpoint_root, f"draft_step_{int(step)}")
+        metadata_path = os.path.join(checkpoint_path, "metadata.json")
+        try:
+            with open(metadata_path, encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            metadata_step = int(metadata.get("step"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if metadata.get("complete") is not True or metadata_step != int(step):
+            return False
+        try:
+            entries = os.listdir(checkpoint_path)
+        except OSError:
+            return False
+        for name in entries:
+            if not name.endswith((".safetensors", ".bin", ".index.json")):
+                continue
+            try:
+                if os.path.getsize(os.path.join(checkpoint_path, name)) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _speco_write_dual_best_record(
+        self, kind: str, record: Mapping[str, Any]
+    ) -> None:
+        path = self._speco_dual_best_manifest_path(kind)
+        if path is None:
+            raise RuntimeError("Dual-best drafter checkpoint path is unavailable")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(dict(record), stream, sort_keys=True)
+            stream.write("\n")
+        os.replace(temporary, path)
+        marker = os.path.join(
+            os.path.dirname(path), f"best_{kind}_checkpointed_iteration.txt"
+        )
+        temporary_marker = f"{marker}.tmp.{os.getpid()}"
+        with open(temporary_marker, "w", encoding="utf-8") as stream:
+            stream.write(f"{int(record['step'])}\n")
+        os.replace(temporary_marker, marker)
+
+    def _speco_maybe_save_dual_best_from_rollout(self) -> dict[str, Any]:
+        if not self._speco_dual_metric_best_enabled():
+            self._speco_pending_dual_best_observation = None
+            return {}
+        pending = getattr(self, "_speco_pending_dual_best_observation", None)
+        if not isinstance(pending, Mapping):
+            return {"drafter/dual_best/checked": 0}
+        current_step = int(getattr(self, "global_steps", 0) or 0)
+        update_step = int(pending.get("update_step", current_step) or current_step)
+        if current_step <= update_step:
+            return {"drafter/dual_best/checked": 0}
+
+        quality = self._speco_current_step_rollout_quality_metrics()
+        acceptance = _speco_metric_float(quality.get("mean_acceptance_length"))
+        throughput = _speco_metric_float(
+            quality.get("response_tokens_per_second")
+        )
+        if acceptance is None or throughput is None or throughput <= 0.0:
+            return {
+                "drafter/dual_best/checked": 0,
+                "drafter/dual_best/waiting_for_complete_rollout_metrics": 1,
+            }
+        self._speco_pending_dual_best_observation = None
+
+        training_cfg = self._speco_drafter_training_config()
+        acceptance_delta = float(
+            training_cfg.get("best_checkpoint_min_acceptance_delta", 0.0) or 0.0
+        )
+        throughput_relative_delta = float(
+            training_cfg.get(
+                "best_checkpoint_min_throughput_relative_delta", 0.0
+            )
+            or 0.0
+        )
+        previous_acceptance = self._speco_load_dual_best_score("acceptance")
+        previous_throughput = self._speco_load_dual_best_score("throughput")
+        acceptance_improved = acceptance > previous_acceptance + acceptance_delta
+        throughput_improved = (
+            not math.isfinite(previous_throughput)
+            or throughput
+            > previous_throughput * (1.0 + throughput_relative_delta)
+        )
+        metrics: dict[str, Any] = {
+            "drafter/dual_best/checked": 1,
+            "drafter/dual_best/update_step": update_step,
+            "drafter/dual_best/observed_step": current_step,
+            "drafter/dual_best/mean_acceptance_length": acceptance,
+            "drafter/dual_best/response_tokens_per_second": throughput,
+            "drafter/dual_best/acceptance_improved": int(acceptance_improved),
+            "drafter/dual_best/throughput_improved": int(throughput_improved),
+            "drafter/dual_best/acceptance_saved": 0,
+            "drafter/dual_best/throughput_saved": 0,
+        }
+        if not acceptance_improved and not throughput_improved:
+            return metrics
+
+        save_started = time.perf_counter()
+        include_optimizer = bool(
+            training_cfg.get(
+                "dual_metric_best_checkpoint_include_optimizer", False
+            )
+        )
+        if not self._speco_has_complete_drafter_checkpoint(update_step):
+            self._speco_save_drafter_checkpoint(
+                wait=True,
+                step=update_step,
+                include_optimizer=include_optimizer,
+            )
+        save_elapsed = time.perf_counter() - save_started
+        common_record = {
+            "schema_version": 1,
+            "step": update_step,
+            "rollout_step": current_step,
+            "actor_snapshot_step": max(current_step - 1, 0),
+            "mean_acceptance_length": acceptance,
+            "response_tokens_per_second": throughput,
+            "response_tokens": int(quality["response_tokens"]),
+            "generation_time_s": float(quality["generation_time_s"]),
+            "verify_steps": int(quality["verify_steps"]),
+            "accepted_tokens": int(quality["accepted_tokens"]),
+            "checkpoint_includes_optimizer": include_optimizer,
+            "requires_final_actor_reevaluation": True,
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if acceptance_improved:
+            self._speco_write_dual_best_record(
+                "acceptance", {**common_record, "selection_metric": "acceptance"}
+            )
+            metrics["drafter/dual_best/acceptance_saved"] = 1
+            metrics["drafter/dual_best/best_acceptance"] = acceptance
+        if throughput_improved:
+            self._speco_write_dual_best_record(
+                "throughput", {**common_record, "selection_metric": "throughput"}
+            )
+            metrics["drafter/dual_best/throughput_saved"] = 1
+            metrics["drafter/dual_best/best_throughput"] = throughput
+        metrics["timing_s/drafter_dual_best_checkpoint"] = save_elapsed
+        return metrics
+
+    def _speco_commit_or_rollback_candidate(
+        self,
+        generate: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        output: Any,
+        selected_alpha: float,
+        metrics: dict[str, Any],
+    ) -> Any:
+        pending = self._speco_pending_candidate_update
+        update_step = int(pending["update_step"])
+        observed = _speco_metric_float(
+            _speco_vllm_spec_decode_metrics_from_batch(output).get(
+                SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC
+            )
+        )
+        baseline = _speco_metric_float(pending.get("full_baseline"))
+        threshold = self._speco_post_update_acceptance_drop_abort_threshold()
+        drop = (
+            baseline - observed
+            if baseline is not None and observed is not None
+            else None
+        )
+        metrics["drafter/candidate/full_rollout_stats_present"] = int(
+            observed is not None
+        )
+        if baseline is not None:
+            metrics["drafter/candidate/full_baseline_acceptance"] = baseline
+        if observed is not None:
+            metrics["drafter/candidate/full_observed_acceptance"] = observed
+        if drop is not None:
+            metrics["drafter/candidate/full_acceptance_drop"] = drop
+
+        should_rollback = selected_alpha > 0.0 and (
+            observed is None
+            or (
+                threshold is not None
+                and drop is not None
+                and drop >= threshold
+            )
+        )
+        if should_rollback:
+            self._speco_publish_candidate_alpha(update_step, 0.0)
+            self._speco_finalize_candidate(update_step, 0.0)
+            metrics["drafter/candidate/rolled_back"] = 1
+            metrics["drafter/candidate/committed"] = 0
+            if observed is not None and baseline is not None and drop is not None:
+                self._speco_record_post_update_acceptance_incident(
+                    update_step=update_step,
+                    observed_step=int(self.global_steps),
+                    baseline=baseline,
+                    observed=observed,
+                    drop=drop,
+                    threshold=float(threshold),
+                    action="rolled_back_and_regenerated",
+                )
+            logger.warning(
+                "Rolling back drafter candidate and regenerating actor batch: "
+                "update_step=%s selected_alpha=%s baseline=%s observed=%s",
+                update_step,
+                selected_alpha,
+                baseline,
+                observed,
+            )
+            output = generate(*args, **kwargs)
+        else:
+            self._speco_finalize_candidate(update_step, selected_alpha)
+            metrics["drafter/candidate/rolled_back"] = 0
+            metrics["drafter/candidate/committed"] = int(selected_alpha > 0.0)
+            if selected_alpha > 0.0 and observed is not None:
+                fixed_gate_score = _speco_metric_float(
+                    metrics.get("drafter/candidate/selected_gate_acceptance")
+                )
+                self._speco_pending_best_candidate_save = {
+                    "update_step": update_step,
+                    "alpha": selected_alpha,
+                    "observed": (
+                        fixed_gate_score
+                        if fixed_gate_score is not None
+                        else observed
+                    ),
+                }
+        self._speco_pending_candidate_update = None
+        return output
 
     def _speco_publish_drafter_weights(self, drafter_trained: bool) -> dict[str, Any]:
         if not self._speco_should_publish_drafter_weights(drafter_trained):
@@ -1956,15 +3332,221 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "actor_rollout_wg exposes it."
         )
 
-    def _speco_store_rollout_metrics(self, output: Any) -> None:
+    def _speco_store_rollout_metrics(self, output: Any, elapsed_sec: float) -> None:
         current_step = getattr(self, "global_steps", None)
         if getattr(self, "_speco_last_rollout_metrics_step", None) != current_step:
             self._speco_last_rollout_metrics = {}
             self._speco_last_rollout_metrics_step = current_step
+            self._speco_last_rollout_generation_elapsed_sec = 0.0
+            self._speco_last_rollout_response_tokens = 0
         self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
             _speco_vllm_spec_decode_stats_from_batch(output),
         )
+        self._speco_last_rollout_generation_elapsed_sec += max(
+            float(elapsed_sec), 0.0
+        )
+        self._speco_last_rollout_response_tokens += self._speco_candidate_response_tokens(
+            output
+        )
+
+    def _speco_store_validation_rollout_metrics(
+        self, output: Any, elapsed_sec: float
+    ) -> None:
+        self._speco_validation_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
+            getattr(self, "_speco_validation_rollout_metrics", None),
+            _speco_vllm_spec_decode_stats_from_batch(output),
+        )
+        self._speco_validation_generation_elapsed_sec = float(
+            getattr(self, "_speco_validation_generation_elapsed_sec", 0.0) or 0.0
+        ) + max(float(elapsed_sec), 0.0)
+        self._speco_validation_response_tokens = int(
+            getattr(self, "_speco_validation_response_tokens", 0) or 0
+        ) + self._speco_candidate_response_tokens(output)
+        self._speco_collect_validation_diagnostics(output)
+
+    def _speco_collect_validation_diagnostics(self, output: Any) -> None:
+        """Collect optional raw token hashes and per-draft-position acceptance."""
+
+        if not os.getenv(_SPECO_VALIDATION_DIAGNOSTICS_DIR_ENV, "").strip():
+            return
+        batch = getattr(output, "batch", None)
+        if batch is None:
+            return
+        try:
+            responses = batch.get("responses")
+            response_mask = batch.get("response_mask")
+        except (AttributeError, KeyError):
+            return
+        if not torch.is_tensor(responses):
+            return
+        if not torch.is_tensor(response_mask):
+            response_mask = torch.ones_like(responses, dtype=torch.bool)
+
+        non_tensor_batch = getattr(output, "non_tensor_batch", {}) or {}
+        traces = non_tensor_batch.get(SPECO_VLLM_SPECULATIVE_TRACE_KEY)
+        request_ids = non_tensor_batch.get("request_id")
+        records = getattr(self, "_speco_validation_token_records", None)
+        if not isinstance(records, list):
+            records = []
+            self._speco_validation_token_records = records
+        position_attempts = getattr(
+            self, "_speco_validation_position_attempts", None
+        )
+        position_accepted = getattr(
+            self, "_speco_validation_position_accepted", None
+        )
+        if not isinstance(position_attempts, list):
+            position_attempts = []
+            self._speco_validation_position_attempts = position_attempts
+        if not isinstance(position_accepted, list):
+            position_accepted = []
+            self._speco_validation_position_accepted = position_accepted
+
+        for row_index in range(int(responses.size(0))):
+            mask = response_mask[row_index].reshape(-1).bool()
+            token_ids = (
+                responses[row_index].reshape(-1)[mask].detach().cpu().tolist()
+            )
+            token_ids = [int(token_id) for token_id in token_ids]
+            token_payload = json.dumps(token_ids, separators=(",", ":")).encode()
+            trace = self._speco_sequence_item(traces, row_index)
+            request_id = self._speco_sequence_item(request_ids, row_index)
+            records.append(
+                {
+                    "sample_index": len(records),
+                    "request_id": str(request_id) if request_id is not None else None,
+                    "response_token_count": len(token_ids),
+                    "response_token_sha256": hashlib.sha256(token_payload).hexdigest(),
+                    "response_token_ids": token_ids,
+                    "speculative_trace_event_count": (
+                        len(trace) if isinstance(trace, (list, tuple)) else 0
+                    ),
+                }
+            )
+            if not isinstance(trace, (list, tuple)):
+                continue
+            for event in trace:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    draft_count = max(int(event.get("draft_count", 0) or 0), 0)
+                    accepted_count = min(
+                        max(int(event.get("accepted_count", 0) or 0), 0),
+                        draft_count,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if draft_count > len(position_attempts):
+                    missing = draft_count - len(position_attempts)
+                    position_attempts.extend([0] * missing)
+                    position_accepted.extend([0] * missing)
+                for position in range(draft_count):
+                    position_attempts[position] += 1
+                    if accepted_count > position:
+                        position_accepted[position] += 1
+
+    def _speco_write_validation_diagnostics(self) -> None:
+        output_dir = os.getenv(_SPECO_VALIDATION_DIAGNOSTICS_DIR_ENV, "").strip()
+        if not output_dir:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        step = int(getattr(self, "global_steps", 0) or 0)
+        records = getattr(self, "_speco_validation_token_records", None) or []
+        token_path = os.path.join(output_dir, f"token_ids.step-{step:06d}.jsonl")
+        token_tmp = f"{token_path}.tmp.{os.getpid()}"
+        ordered_digest = hashlib.sha256()
+        with open(token_tmp, "w", encoding="utf-8") as stream:
+            for record in records:
+                digest = str(record.get("response_token_sha256", ""))
+                ordered_digest.update(f"{len(digest)}:{digest}".encode())
+                stream.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
+                stream.write("\n")
+        os.replace(token_tmp, token_path)
+
+        attempts = getattr(self, "_speco_validation_position_attempts", None) or []
+        accepted = getattr(self, "_speco_validation_position_accepted", None) or []
+        positions = [
+            {
+                "position": index + 1,
+                "attempted": int(attempted),
+                "accepted": int(accepted[index]),
+                "acceptance_rate": (
+                    float(accepted[index]) / float(attempted) if attempted else None
+                ),
+            }
+            for index, attempted in enumerate(attempts)
+        ]
+        summary = {
+            "schema_version": 1,
+            "global_step": step,
+            "sample_count": len(records),
+            "ordered_response_token_sha256": ordered_digest.hexdigest(),
+            "token_ids_path": os.path.realpath(token_path),
+            "trace_event_count": sum(
+                int(record.get("speculative_trace_event_count", 0) or 0)
+                for record in records
+            ),
+            "acceptance_by_position": positions,
+        }
+        summary_path = os.path.join(
+            output_dir, f"spec_decode.step-{step:06d}.json"
+        )
+        summary_tmp = f"{summary_path}.tmp.{os.getpid()}"
+        with open(summary_tmp, "w", encoding="utf-8") as stream:
+            json.dump(summary, stream, ensure_ascii=True, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(summary_tmp, summary_path)
+
+    def _speco_validation_spec_decode_metrics(self) -> dict[str, float]:
+        stats = getattr(self, "_speco_validation_rollout_metrics", None) or {}
+        drafts = float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
+        accepted_tokens = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
+        )
+        if drafts <= 0.0:
+            return {}
+        elapsed_sec = float(
+            getattr(self, "_speco_validation_generation_elapsed_sec", 0.0) or 0.0
+        )
+        response_tokens = float(
+            getattr(self, "_speco_validation_response_tokens", 0) or 0
+        )
+        prefix = _SPECO_VALIDATION_SPEC_DECODE_PREFIX
+        metrics = {
+            f"{prefix}/mean_acceptance_length": 1.0 + accepted_tokens / drafts,
+            f"{prefix}/verify_steps": drafts,
+            f"{prefix}/accepted_tokens": accepted_tokens,
+            f"{prefix}/generation_time_s": elapsed_sec,
+            f"{prefix}/response_tokens": response_tokens,
+            f"{prefix}/response_tokens_per_second": (
+                response_tokens / elapsed_sec if elapsed_sec > 0.0 else 0.0
+            ),
+        }
+        attempts = getattr(self, "_speco_validation_position_attempts", None) or []
+        accepted = getattr(self, "_speco_validation_position_accepted", None) or []
+        for index, attempted in enumerate(attempts):
+            metrics[f"{prefix}/position_{index + 1}_attempted"] = float(attempted)
+            metrics[f"{prefix}/position_{index + 1}_accepted"] = float(
+                accepted[index]
+            )
+            metrics[f"{prefix}/position_{index + 1}_acceptance_rate"] = (
+                float(accepted[index]) / float(attempted) if attempted else 0.0
+            )
+        return metrics
+
+    def _validate(self, merged: bool = False):
+        self._speco_validation_rollout_metrics = {}
+        self._speco_validation_generation_elapsed_sec = 0.0
+        self._speco_validation_response_tokens = 0
+        self._speco_validation_token_records = []
+        self._speco_validation_position_attempts = []
+        self._speco_validation_position_accepted = []
+        metrics = super()._validate(merged=merged)
+        if merged or not isinstance(metrics, dict):
+            return metrics
+        self._speco_write_validation_diagnostics()
+        return {**metrics, **self._speco_validation_spec_decode_metrics()}
 
     def _speco_current_step_rollout_metrics(self) -> dict[str, float]:
         if getattr(self, "_speco_last_rollout_metrics_step", None) != getattr(
@@ -1975,15 +3557,276 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
 
+    def _speco_current_step_rollout_quality_metrics(self) -> dict[str, float]:
+        if getattr(self, "_speco_last_rollout_metrics_step", None) != getattr(
+            self, "global_steps", None
+        ):
+            return {}
+        stats = getattr(self, "_speco_last_rollout_metrics", None) or {}
+        verify_steps = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0
+        )
+        accepted_tokens = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
+        )
+        elapsed_sec = float(
+            getattr(self, "_speco_last_rollout_generation_elapsed_sec", 0.0)
+            or 0.0
+        )
+        response_tokens = float(
+            getattr(self, "_speco_last_rollout_response_tokens", 0) or 0
+        )
+        if verify_steps <= 0.0 or elapsed_sec <= 0.0 or response_tokens <= 0.0:
+            return {}
+        return {
+            "mean_acceptance_length": 1.0 + accepted_tokens / verify_steps,
+            "verify_steps": verify_steps,
+            "accepted_tokens": accepted_tokens,
+            "generation_time_s": elapsed_sec,
+            "response_tokens": response_tokens,
+            "response_tokens_per_second": response_tokens / elapsed_sec,
+        }
+
+    def _speco_post_update_acceptance_drop_abort_threshold(self) -> float | None:
+        """Return the configured absolute drop in mean acceptance length to abort on."""
+        raw_threshold = self._speco_drafter_training_config().get(
+            "post_update_mean_acceptance_length_drop_abort_threshold", None
+        )
+        if raw_threshold in (None, ""):
+            return None
+        try:
+            threshold = float(raw_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "post_update_mean_acceptance_length_drop_abort_threshold must be "
+                "a non-negative number or null"
+            ) from exc
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError(
+                "post_update_mean_acceptance_length_drop_abort_threshold must be "
+                "a finite non-negative number or null"
+            )
+        return threshold
+
+    def _speco_acceptance_incident_log_path(self) -> str:
+        """Resolve the append-only post-update acceptance incident ledger."""
+        training_cfg = self._speco_drafter_training_config()
+        configured_path = training_cfg.get(
+            "post_update_acceptance_incident_log_path", None
+        )
+        if configured_path not in (None, ""):
+            return os.path.abspath(os.path.expanduser(str(configured_path)))
+
+        environment_path = os.environ.get("SPECO_DRAFTER_ACCEPTANCE_INCIDENT_LOG")
+        if environment_path:
+            return os.path.abspath(os.path.expanduser(environment_path))
+
+        checkpoint_dir = _get_nested(
+            self.config, ("trainer", "default_local_dir"), None
+        )
+        if checkpoint_dir not in (None, ""):
+            checkpoint_root = os.path.dirname(os.path.abspath(str(checkpoint_dir)))
+            if os.path.basename(checkpoint_root) == "checkpoints":
+                return os.path.join(
+                    os.path.dirname(checkpoint_root),
+                    "drafter_acceptance_incidents.jsonl",
+                )
+        return os.path.abspath("outputs/drafter_acceptance_incidents.jsonl")
+
+    def _speco_record_post_update_acceptance_incident(
+        self,
+        *,
+        update_step: int,
+        observed_step: int,
+        baseline: float,
+        observed: float,
+        drop: float,
+        threshold: float,
+        action: str = "aborted",
+    ) -> str | None:
+        """Append a guard-triggered regression before terminating training."""
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(
+            _get_nested(drafter_cfg, ("speculative_algorithm",), "unknown")
+            or "unknown"
+        ).lower()
+        strategy_version = os.environ.get("SPECO_ONLINE_STRATEGY_TAG", "legacy")
+        experiment_id = os.environ.get("SPECO_EXPERIMENT_ID", "unknown")
+        log_file = os.environ.get("SPECO_TRAINING_LOG_FILE", "")
+        event_identity = (
+            f"{experiment_id}:{strategy_version}:{update_step}:{observed_step}:"
+            f"{baseline:.12g}:{observed:.12g}:{threshold:.12g}"
+        )
+        record = {
+            "schema_version": 1,
+            "incident_id": hashlib.blake2b(
+                event_identity.encode(), digest_size=12
+            ).hexdigest(),
+            "event": "post_update_mean_acceptance_length_regression",
+            "source": "runtime_guard",
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "algorithm": algorithm,
+            "strategy_version": strategy_version or "legacy",
+            "experiment_id": experiment_id or "unknown",
+            "run_mode": os.environ.get("SPECO_RUN_MODE", "unknown"),
+            "wandb_run_id": os.environ.get("WANDB_RUN_ID", ""),
+            "training_log": log_file,
+            "update_step": int(update_step),
+            "observed_step": int(observed_step),
+            "baseline_mean_acceptance_length": float(baseline),
+            "observed_mean_acceptance_length": float(observed),
+            "drop": float(drop),
+            "threshold": float(threshold),
+        }
+        path = self._speco_acceptance_incident_log_path()
+        encoded_record = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, encoded_record)
+            finally:
+                os.close(fd)
+        except OSError:
+            logger.exception(
+                "Failed to record post-update drafter acceptance incident at %s", path
+            )
+            return None
+        return path
+
+    def _speco_arm_post_update_acceptance_guard(
+        self, publish_metrics: Mapping[str, Any]
+    ) -> dict[str, float | int]:
+        """Record the pre-update global acceptance metric after a synchronous publish."""
+        threshold = self._speco_post_update_acceptance_drop_abort_threshold()
+        if threshold is None or not bool(publish_metrics.get("drafter/published", 0)):
+            return {}
+
+        training_cfg = self._speco_drafter_training_config()
+        if bool(training_cfg.get("publish_async", False)):
+            return {
+                "drafter/post_update_acceptance_guard/armed": 0,
+                "drafter/post_update_acceptance_guard/async_publish_skipped": 1,
+            }
+
+        baseline = _speco_metric_float(
+            self._speco_current_step_rollout_metrics().get(
+                SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC
+            )
+        )
+        if baseline is None:
+            return {
+                "drafter/post_update_acceptance_guard/armed": 0,
+                "drafter/post_update_acceptance_guard/missing_baseline": 1,
+            }
+
+        self._speco_pending_post_update_acceptance_guard = {
+            "baseline": baseline,
+            "update_step": int(self.global_steps),
+            "threshold": threshold,
+        }
+        return {
+            "drafter/post_update_acceptance_guard/armed": 1,
+            "drafter/post_update_acceptance_guard/baseline_mean_acceptance_length": baseline,
+            "drafter/post_update_acceptance_guard/threshold": threshold,
+        }
+
+    def _speco_arm_dual_best_observation(
+        self, publish_metrics: Mapping[str, Any]
+    ) -> dict[str, float | int]:
+        if not self._speco_dual_metric_best_enabled() or not bool(
+            publish_metrics.get("drafter/published", 0)
+        ):
+            return {}
+        training_cfg = self._speco_drafter_training_config()
+        if bool(training_cfg.get("publish_async", False)):
+            return {
+                "drafter/dual_best/armed": 0,
+                "drafter/dual_best/async_publish_skipped": 1,
+            }
+        self._speco_pending_dual_best_observation = {
+            "update_step": int(self.global_steps)
+        }
+        return {
+            "drafter/dual_best/armed": 1,
+            "drafter/dual_best/pending_update_step": int(self.global_steps),
+        }
+
+    def _speco_check_post_update_acceptance_guard(self) -> dict[str, float | int]:
+        """Abort when the first rollout using a published update regresses too far."""
+        threshold = self._speco_post_update_acceptance_drop_abort_threshold()
+        pending = getattr(self, "_speco_pending_post_update_acceptance_guard", None)
+        if threshold is None:
+            self._speco_pending_post_update_acceptance_guard = None
+            return {}
+        if not isinstance(pending, Mapping):
+            return {"drafter/post_update_acceptance_guard/checked": 0}
+
+        current_step = int(getattr(self, "global_steps", 0) or 0)
+        update_step = int(pending.get("update_step", current_step) or current_step)
+        if current_step <= update_step:
+            return {"drafter/post_update_acceptance_guard/checked": 0}
+
+        observed = _speco_metric_float(
+            self._speco_current_step_rollout_metrics().get(
+                SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC
+            )
+        )
+        if observed is None:
+            return {
+                "drafter/post_update_acceptance_guard/checked": 0,
+                "drafter/post_update_acceptance_guard/waiting_for_speculative_rollout": 1,
+            }
+
+        baseline = float(pending["baseline"])
+        drop = baseline - observed
+        self._speco_pending_post_update_acceptance_guard = None
+        metrics: dict[str, float | int] = {
+            "drafter/post_update_acceptance_guard/checked": 1,
+            "drafter/post_update_acceptance_guard/baseline_mean_acceptance_length": baseline,
+            "drafter/post_update_acceptance_guard/observed_mean_acceptance_length": observed,
+            "drafter/post_update_acceptance_guard/drop": drop,
+            "drafter/post_update_acceptance_guard/threshold": threshold,
+        }
+        if drop >= threshold:
+            incident_path = self._speco_record_post_update_acceptance_incident(
+                update_step=update_step,
+                observed_step=current_step,
+                baseline=baseline,
+                observed=observed,
+                drop=drop,
+                threshold=threshold,
+            )
+            message = (
+                "Aborting training: a published drafter update regressed global "
+                "mean acceptance length by at least the configured threshold; "
+                f"update_step={update_step}, observed_step={current_step}, "
+                f"baseline={baseline:.6f}, observed={observed:.6f}, "
+                f"drop={drop:.6f}, threshold={threshold:.6f}, "
+                f"incident_log={incident_path or 'write_failed'}"
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+        return metrics
+
     @contextmanager
     def _speco_rollout_metrics_fit_hook(self):
         rollout_generation_target = self._speco_rollout_generation_target()
         original_generate_sequences = rollout_generation_target.generate_sequences
 
         def generate_sequences_with_speco_metrics(manager_self, *args, **kwargs):
+            started = time.perf_counter()
             gen_batch_output = original_generate_sequences(*args, **kwargs)
-            if not _speco_is_validation_generation(args, kwargs, gen_batch_output):
-                self._speco_store_rollout_metrics(gen_batch_output)
+            elapsed_sec = time.perf_counter() - started
+            if _speco_is_validation_generation(args, kwargs, gen_batch_output):
+                self._speco_store_validation_rollout_metrics(
+                    gen_batch_output, elapsed_sec
+                )
+            else:
+                self._speco_store_rollout_metrics(gen_batch_output, elapsed_sec)
             return gen_batch_output
 
         rollout_generation_target.generate_sequences = MethodType(
@@ -2003,12 +3846,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             yield
             return
 
+        original_init = getattr(Tracking, "__init__", None)
         original_log = getattr(Tracking, "log", None)
-        if not callable(original_log) or getattr(
-            original_log, "_speco_drafter_timing_hook", False
+        if (
+            not callable(original_init)
+            or not callable(original_log)
+            or getattr(original_log, "_speco_drafter_timing_hook", False)
         ):
             yield
             return
+
+        tracking_instances = []
+
+        def init_with_speco_finish(tracking_self, *args, **kwargs):
+            original_init(tracking_self, *args, **kwargs)
+            tracking_instances.append(tracking_self)
 
         def log_with_speco_metrics(tracking_self, *args, **kwargs):
             latest_rollout_metrics = self._speco_current_step_rollout_metrics()
@@ -2022,7 +3874,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ):
                     data = dict(data)
                     data.update(latest_rollout_metrics)
-                kwargs["data"] = _speco_move_drafter_timing_next_to_update_actor(data)
+                kwargs["data"] = _speco_add_key_metric_aliases(
+                    _speco_move_drafter_timing_next_to_update_actor(data)
+                )
                 return original_log(tracking_self, *args, **kwargs)
             if args:
                 data = args[0]
@@ -2034,17 +3888,38 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     data = dict(data)
                     data.update(latest_rollout_metrics)
                 args = (
-                    _speco_move_drafter_timing_next_to_update_actor(data),
+                    _speco_add_key_metric_aliases(
+                        _speco_move_drafter_timing_next_to_update_actor(data)
+                    ),
                     *args[1:],
                 )
             return original_log(tracking_self, *args, **kwargs)
 
         log_with_speco_metrics._speco_drafter_timing_hook = True
+        Tracking.__init__ = init_with_speco_finish
         Tracking.log = log_with_speco_metrics
+        completed = False
         try:
             yield
+            completed = True
         finally:
+            Tracking.__init__ = original_init
             Tracking.log = original_log
+            for tracking_instance in tracking_instances:
+                logger_map = getattr(tracking_instance, "logger", None)
+                if not isinstance(logger_map, dict):
+                    continue
+                wandb_logger = logger_map.pop("wandb", None)
+                if wandb_logger is None:
+                    continue
+                exit_code = 0 if completed else 1
+                try:
+                    wandb_logger.finish(exit_code=exit_code)
+                    teardown = getattr(wandb_logger, "teardown", None)
+                    if callable(teardown):
+                        teardown(exit_code=exit_code)
+                except Exception:
+                    logger.exception("Failed to finish the SPECO W&B run cleanly")
 
     def _speco_compute_old_log_prob_without_forced_entropy(self, batch: DataProto):
         batch = _select_policy_model_batch(batch)
@@ -2118,12 +3993,56 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
+            is_validation_input = _speco_is_validation_generation(args, kwargs)
+            candidate_metrics: dict[str, Any] = {}
+            selected_alpha = None
+            if (
+                not is_validation_input
+                and isinstance(self._speco_pending_candidate_update, Mapping)
+            ):
+                pending = self._speco_pending_candidate_update
+                try:
+                    selected_alpha, candidate_metrics = (
+                        self._speco_select_candidate_with_rollout(
+                            original_generate_sequences, args, kwargs
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Candidate rollout gate failed; restoring baseline drafter"
+                    )
+                    update_step = int(pending["update_step"])
+                    self._speco_publish_candidate_alpha(update_step, 0.0)
+                    self._speco_finalize_candidate(update_step, 0.0)
+                    self._speco_pending_candidate_update = None
+                    candidate_metrics = {
+                        "drafter/candidate/gate_ran": 1,
+                        "drafter/candidate/gate_failed": 1,
+                        "drafter/candidate/selected_alpha": 0.0,
+                    }
+            rollout_started = time.perf_counter()
             gen_batch_output = original_generate_sequences(*args, **kwargs)
+            if selected_alpha is not None:
+                gen_batch_output = self._speco_commit_or_rollback_candidate(
+                    original_generate_sequences,
+                    args,
+                    kwargs,
+                    gen_batch_output,
+                    selected_alpha,
+                    candidate_metrics,
+                )
+            rollout_elapsed = time.perf_counter() - rollout_started
+            if candidate_metrics:
+                self._speco_pending_candidate_metrics.update(candidate_metrics)
             is_validation_generation = _speco_is_validation_generation(
                 args, kwargs, gen_batch_output
             )
-            if not is_validation_generation:
-                self._speco_store_rollout_metrics(gen_batch_output)
+            if is_validation_generation:
+                self._speco_store_validation_rollout_metrics(
+                    gen_batch_output, rollout_elapsed
+                )
+            else:
+                self._speco_store_rollout_metrics(gen_batch_output, rollout_elapsed)
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:
                     meta_info = getattr(gen_batch_output, "meta_info", None)
@@ -2134,6 +4053,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return gen_batch_output
 
         def compute_old_log_prob_with_speco(trainer_self, batch: DataProto):
+            self._speco_fixed_eval_export_metrics = {}
             if not self._speco_oldlogprob_collection_enabled():
                 if self._speco_oldlogprob_entropy_hook_enabled():
                     return self._speco_compute_old_log_prob_without_forced_entropy(
@@ -2147,6 +4067,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collected_samples = 0
             self._speco_last_oldlogprob_collected_rows = 0
             self._speco_last_oldlogprob_payload_mib = 0.0
+            self._speco_last_oldlogprob_window_strata = {}
+            self._speco_last_oldlogprob_materialized_window_strata = {}
+            self._speco_last_oldlogprob_drop_reasons = {}
+            self._speco_last_oldlogprob_dispatched_samples = 0
+            self._speco_last_oldlogprob_consumed_samples = 0
+            self._speco_last_oldlogprob_unique_samples = 0
+            self._speco_last_oldlogprob_consumed_unique_samples = 0
+            self._speco_last_spec_trace_samples = 0
+            self._speco_last_spec_trace_verify_steps = 0
+            self._speco_last_spec_trace_draft_tokens = 0
+            self._speco_last_spec_trace_teacher_logprob_tokens = 0
+            self._speco_last_spec_trace_accepted_tokens = 0
+            self._speco_last_spec_trace_first_rejections = 0
+            self._speco_last_spec_trace_unverified_suffix_tokens = 0
+            self._speco_last_spec_trace_all_accepted_steps = 0
+            self._speco_last_spec_trace_diagnostics = {}
+            self._speco_last_fixed_eval_trace_metrics = {}
+            self._speco_last_drafter_guard_reason = ""
             self._speco_last_oldlogprob_select_elapsed_sec = 0.0
             self._speco_last_oldlogprob_sp_merge_elapsed_sec = 0.0
             self._speco_last_oldlogprob_concat_elapsed_sec = 0.0
@@ -2189,10 +4127,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if not collect_interval_matched or not train_interval_matched:
                 return compute_old_log_prob_without_collection()
 
-            batch = _select_policy_model_batch(batch)
-            collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
+            collect_plan = self._speco_build_oldlogprob_collect_plan(original_batch)
             if collect_plan is None:
                 return compute_old_log_prob_without_collection()
+            self._speco_export_fixed_eval_snapshot(original_batch, collect_plan)
+            batch = _select_policy_model_batch(original_batch)
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self._speco_oldlogprob_calculate_entropy()
@@ -2233,7 +4172,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 time.perf_counter() - compute_started
             )
             collect_started = time.perf_counter()
-            self._speco_collect_oldlogprob_features(batch, collect_plan, output)
+            self._speco_collect_oldlogprob_features(
+                original_batch, collect_plan, output
+            )
             self._speco_last_oldlogprob_collect_elapsed_sec = (
                 time.perf_counter() - collect_started
             )
@@ -2268,7 +4209,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_actor_with_speco(trainer_self, *args, **kwargs):
             update_actor_started = time.perf_counter()
-            metrics = {
+            metrics = dict(self._speco_pending_candidate_metrics)
+            metrics.update(getattr(self, "_speco_fixed_eval_export_metrics", {}))
+            self._speco_pending_candidate_metrics = {}
+            metrics.update({
                 "drafter/raw_drafter_samples": int(
                     getattr(self, "_speco_last_raw_drafter_samples", 0)
                 ),
@@ -2281,8 +4225,217 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "drafter/train_interval_matched": int(
                     self._speco_should_train_drafter_this_step()
                 ),
+                "drafter/oldlogprob_candidate_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_candidate_samples", 0)
+                ),
+                "drafter/oldlogprob_planned_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_planned_samples", 0)
+                ),
+                "drafter/oldlogprob_materialized_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_collected_samples", 0)
+                ),
+                "drafter/oldlogprob_dispatched_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_dispatched_samples", 0)
+                ),
+                "drafter/oldlogprob_consumed_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_consumed_samples", 0)
+                ),
+                "drafter/oldlogprob_unique_samples": int(
+                    getattr(self, "_speco_last_oldlogprob_unique_samples", 0)
+                ),
+                "drafter/oldlogprob_consumed_unique_samples": int(
+                    getattr(
+                        self, "_speco_last_oldlogprob_consumed_unique_samples", 0
+                    )
+                ),
+                "drafter/oldlogprob_collected_rows": int(
+                    getattr(self, "_speco_last_oldlogprob_collected_rows", 0)
+                ),
+                "drafter/spec_trace_samples": int(
+                    getattr(self, "_speco_last_spec_trace_samples", 0)
+                ),
+                "drafter/spec_trace_verify_steps": int(
+                    getattr(self, "_speco_last_spec_trace_verify_steps", 0)
+                ),
+                "drafter/spec_trace_draft_tokens": int(
+                    getattr(self, "_speco_last_spec_trace_draft_tokens", 0)
+                ),
+                "drafter/spec_trace_teacher_logprob_tokens": int(
+                    getattr(
+                        self, "_speco_last_spec_trace_teacher_logprob_tokens", 0
+                    )
+                ),
+                "drafter/spec_trace_accepted_tokens": int(
+                    getattr(self, "_speco_last_spec_trace_accepted_tokens", 0)
+                ),
+                "drafter/spec_trace_first_rejections": int(
+                    getattr(self, "_speco_last_spec_trace_first_rejections", 0)
+                ),
+                "drafter/spec_trace_unverified_suffix_tokens": int(
+                    getattr(
+                        self,
+                        "_speco_last_spec_trace_unverified_suffix_tokens",
+                        0,
+                    )
+                ),
+                "drafter/spec_trace_all_accepted_steps": int(
+                    getattr(self, "_speco_last_spec_trace_all_accepted_steps", 0)
+                ),
+            })
+            metrics.update(self._speco_maybe_save_dual_best_from_rollout())
+            if not self._speco_candidate_gate_enabled():
+                metrics.update(self._speco_check_post_update_acceptance_guard())
+            collected_samples = int(
+                getattr(self, "_speco_last_oldlogprob_collected_samples", 0)
+            )
+            planned_samples = int(
+                getattr(self, "_speco_last_oldlogprob_planned_samples", 0)
+            )
+            dispatched_samples = int(
+                getattr(self, "_speco_last_oldlogprob_dispatched_samples", 0)
+            )
+            consumed_samples = int(
+                getattr(self, "_speco_last_oldlogprob_consumed_samples", 0)
+            )
+            metrics["drafter/oldlogprob_materialization_ratio"] = (
+                collected_samples / planned_samples if planned_samples > 0 else 0.0
+            )
+            metrics["drafter/oldlogprob_consumption_ratio"] = (
+                consumed_samples / dispatched_samples
+                if dispatched_samples > 0
+                else 0.0
+            )
+            draft_tokens = int(
+                getattr(self, "_speco_last_spec_trace_draft_tokens", 0)
+            )
+            accepted_tokens = int(
+                getattr(self, "_speco_last_spec_trace_accepted_tokens", 0)
+            )
+            metrics["drafter/spec_trace_unaccepted_tokens"] = max(
+                draft_tokens - accepted_tokens, 0
+            )
+            metrics["drafter/spec_trace_rejected_tokens"] = metrics[
+                "drafter/spec_trace_first_rejections"
+            ]
+            metrics["drafter/spec_trace_sample_coverage"] = (
+                metrics["drafter/spec_trace_samples"] / collected_samples
+                if collected_samples > 0
+                else 0.0
+            )
+            metrics["drafter/spec_trace_token_acceptance"] = (
+                accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0
+            )
+            teacher_logprob_tokens = int(
+                getattr(
+                    self, "_speco_last_spec_trace_teacher_logprob_tokens", 0
+                )
+            )
+            metrics["drafter/spec_trace_teacher_logprob_coverage"] = (
+                teacher_logprob_tokens / draft_tokens if draft_tokens > 0 else 0.0
+            )
+            window_strata = getattr(
+                self, "_speco_last_oldlogprob_window_strata", {}
+            )
+            for stratum in ("front", "middle", "tail", "full"):
+                metrics[f"drafter/window_samples_{stratum}"] = int(
+                    window_strata.get(stratum, 0)
+                )
+            materialized_strata = getattr(
+                self, "_speco_last_oldlogprob_materialized_window_strata", {}
+            )
+            for stratum in ("front", "middle", "tail", "full", "unknown"):
+                metrics[f"drafter/materialized_window_samples_{stratum}"] = int(
+                    materialized_strata.get(stratum, 0)
+                )
+            for reason, count in (
+                getattr(self, "_speco_last_oldlogprob_drop_reasons", {}) or {}
+            ).items():
+                metrics[f"drafter/collection_drop/{reason}"] = int(count)
+            for stage, count in (
+                getattr(self, "_speco_last_spec_trace_diagnostics", {}) or {}
+            ).items():
+                safe_stage = str(stage).replace("/", "_").replace(" ", "_")
+                metrics[f"drafter/spec_trace_stage/{safe_stage}"] = int(count)
+
+            fixed_eval = getattr(self, "_speco_last_fixed_eval_trace_metrics", {}) or {}
+            for key in (
+                "materialized_samples",
+                "samples",
+                "verify_steps",
+                "draft_tokens",
+                "accepted_tokens",
+                "first_rejections",
+                "unverified_suffix_tokens",
+                "all_accepted_steps",
+                "actor_snapshot_step",
+            ):
+                metrics[f"drafter/fixed_eval/{key}"] = int(fixed_eval.get(key, 0) or 0)
+            fixed_drafts = int(fixed_eval.get("draft_tokens", 0) or 0)
+            fixed_accepted = int(fixed_eval.get("accepted_tokens", 0) or 0)
+            fixed_verify_steps = int(fixed_eval.get("verify_steps", 0) or 0)
+            metrics["drafter/fixed_eval/unaccepted_tokens"] = max(
+                fixed_drafts - fixed_accepted, 0
+            )
+            metrics["drafter/fixed_eval/rejected_tokens"] = int(
+                fixed_eval.get("first_rejections", 0) or 0
+            )
+            metrics["drafter/fixed_eval/token_acceptance"] = (
+                fixed_accepted / fixed_drafts if fixed_drafts > 0 else 0.0
+            )
+            metrics["drafter/fixed_eval/mean_acceptance_length"] = (
+                1.0 + fixed_accepted / fixed_verify_steps
+                if fixed_verify_steps > 0
+                else 0.0
+            )
+
+            train_requested = self._speco_should_attempt_drafter_train_this_step()
+            guard_applicable = (
+                self._speco_oldlogprob_collection_requested()
+                and bool(getattr(self, "_speco_last_collect_interval_matched", 0))
+                and self._speco_should_train_drafter_this_step()
+                and planned_samples > 0
+            )
+            guard_passed, guard_reason = (
+                self._speco_drafter_collection_guard()
+                if guard_applicable
+                else (True, "not_applicable")
+            )
+            self._speco_last_drafter_guard_reason = guard_reason
+            guard_reason_ids = {
+                "not_applicable": 0,
+                "not_oldlogprob_collection": 0,
+                "ok": 1,
+                "materialization_coverage": 2,
+                "worker_consumption_coverage": 3,
+                "spec_trace_coverage": 4,
+                "spec_trace_teacher_logprob_coverage": 5,
             }
-            should_train_drafter = self._speco_should_attempt_drafter_train_this_step()
+            metrics["drafter/training_guard_applicable"] = int(guard_applicable)
+            metrics["drafter/training_guard_passed"] = int(guard_passed)
+            metrics["drafter/training_guard_blocked"] = int(
+                train_requested and not guard_passed
+            )
+            metrics["drafter/training_guard_reason_id"] = int(
+                guard_reason_ids.get(guard_reason, -1)
+            )
+            should_train_drafter = train_requested and guard_passed
+            if train_requested and not guard_passed:
+                message = (
+                    "Skipping drafter update because collection integrity guard failed: "
+                    f"reason={guard_reason}, planned={planned_samples}, "
+                    f"materialized={collected_samples}, dispatched={dispatched_samples}, "
+                    f"consumed={consumed_samples}, trace_samples="
+                    f"{metrics['drafter/spec_trace_samples']}"
+                )
+                action = str(
+                    self._speco_drafter_training_config().get(
+                        "collection_integrity_fail_action", "skip"
+                    )
+                    or "skip"
+                ).lower()
+                if action == "raise":
+                    raise RuntimeError(message)
+                logger.warning(message)
             if should_train_drafter:
                 self._speco_set_drafter_global_step()
                 metrics.update(self._speco_sync_target_lm_head_weight())
@@ -2291,6 +4444,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             actor_started = time.perf_counter()
             actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
+            pending_best = self._speco_pending_best_candidate_save
+            if isinstance(pending_best, Mapping):
+                self._speco_pending_best_candidate_save = None
+                metrics.update(
+                    self._speco_maybe_save_best_candidate(**pending_best)
+                )
             if should_train_drafter:
                 drafter_trained, train_metrics = self._speco_train_drafter()
             else:
@@ -2306,12 +4465,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     },
                 )
             metrics.update(train_metrics)
-            if defer_publish_until_update_weights and drafter_trained:
+            if self._speco_candidate_gate_enabled() and drafter_trained:
+                metrics.update(
+                    self._speco_stage_candidate_update(
+                        drafter_trained, train_metrics
+                    )
+                )
+            elif defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained
                 pending_drafter_publish["actor_output"] = actor_output
             else:
-                metrics.update(self._speco_publish_drafter_weights(drafter_trained))
+                publish_metrics = self._speco_publish_drafter_weights(drafter_trained)
+                metrics.update(publish_metrics)
+                metrics.update(
+                    self._speco_arm_post_update_acceptance_guard(publish_metrics)
+                )
+                metrics.update(self._speco_arm_dual_best_observation(publish_metrics))
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
@@ -2334,9 +4504,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
-            if pending_drafter_publish["ready"]:
+            if (
+                pending_drafter_publish["ready"]
+                and not self._speco_candidate_gate_enabled()
+            ):
                 publish_metrics = self._speco_publish_drafter_weights(
                     pending_drafter_publish["drafter_trained"]
+                )
+                publish_metrics.update(
+                    self._speco_arm_post_update_acceptance_guard(publish_metrics)
+                )
+                publish_metrics.update(
+                    self._speco_arm_dual_best_observation(publish_metrics)
                 )
                 self._speco_update_output_metrics(
                     pending_drafter_publish["actor_output"], publish_metrics
@@ -2399,30 +4578,127 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return drafter_enabled and training_enabled
 
     def fit(self):
+        fit_completed = False
         try:
-            if self.is_drafter_training_enabled(self.config):
-                self._speco_activate_drafter_training_model_before_fit()
-                with (
-                    self._speco_tracking_metrics_hook(),
-                    self._speco_online_fit_hooks(),
-                ):
-                    return super().fit()
-            if self.is_drafter_rollout_enabled(self.config):
-                with (
-                    self._speco_tracking_metrics_hook(),
-                    self._speco_rollout_metrics_fit_hook(),
-                ):
-                    if self._speco_oldlogprob_entropy_hook_enabled():
-                        with self._speco_oldlogprob_entropy_fit_hook():
-                            return super().fit()
-                    return super().fit()
-            if self._speco_oldlogprob_entropy_hook_enabled():
-                with self._speco_oldlogprob_entropy_fit_hook():
-                    return super().fit()
+            with self._speco_checkpoint_offset_hook():
+                if self.is_drafter_training_enabled(self.config):
+                    self._speco_activate_drafter_training_model_before_fit()
+                    with (
+                        self._speco_tracking_metrics_hook(),
+                        self._speco_online_fit_hooks(),
+                    ):
+                        result = super().fit()
+                        fit_completed = True
+                        return result
+                if self.is_drafter_rollout_enabled(self.config):
+                    with (
+                        self._speco_tracking_metrics_hook(),
+                        self._speco_rollout_metrics_fit_hook(),
+                    ):
+                        if self._speco_oldlogprob_entropy_hook_enabled():
+                            with self._speco_oldlogprob_entropy_fit_hook():
+                                result = super().fit()
+                                fit_completed = True
+                                return result
+                        result = super().fit()
+                        fit_completed = True
+                        return result
+                if self._speco_oldlogprob_entropy_hook_enabled():
+                    with self._speco_oldlogprob_entropy_fit_hook():
+                        result = super().fit()
+                        fit_completed = True
+                        return result
 
-            return super().fit()
+                result = super().fit()
+                fit_completed = True
+                return result
         finally:
+            pending_candidate = getattr(
+                self, "_speco_pending_candidate_update", None
+            )
+            if isinstance(pending_candidate, Mapping):
+                update_step = int(pending_candidate["update_step"])
+                logger.warning(
+                    "Discarding unvalidated terminal drafter candidate at step %s",
+                    update_step,
+                )
+                self._speco_finalize_candidate(update_step, 0.0)
+                self._speco_pending_candidate_update = None
             self._speco_wait_pending_drafter_checkpoint()
+            if fit_completed and getattr(
+                self, "_speco_last_saved_drafter_step", None
+            ) != int(self.global_steps):
+                # Periodic saves may intentionally be shifted away from publish
+                # steps. Persist the exact terminal drafter state as well.
+                self._speco_save_drafter_checkpoint(wait=True)
+            if fit_completed:
+                self._speco_mark_final_drafter_checkpoint()
+
+    def _speco_checkpoint_save_offset(self) -> int:
+        value = _get_nested(self.config, ("speco", "checkpoint", "save_offset"), 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @contextmanager
+    def _speco_checkpoint_offset_hook(self):
+        """Shift upstream periodic saves without modifying the pinned VERL checkout."""
+
+        trainer_cfg = _get_nested(self.config, ("trainer",), None)
+        frequency = _get_nested(self.config, ("trainer", "save_freq"), -1)
+        offset = self._speco_checkpoint_save_offset()
+        try:
+            frequency = int(frequency)
+        except (TypeError, ValueError):
+            frequency = -1
+        if frequency <= 0 or offset == 0:
+            yield
+            return
+        if offset < 0 or offset >= frequency:
+            raise ValueError(
+                f"speco.checkpoint.save_offset must satisfy 0 <= offset < save_freq; "
+                f"got offset={offset}, save_freq={frequency}"
+            )
+
+        original_update_actor = self._update_actor
+        original_save_freq = _get_nested(
+            self.config, ("trainer", "save_freq"), frequency
+        )
+        last_saved_step = None
+
+        def update_actor_with_offset(trainer_self, batch):
+            nonlocal last_saved_step
+            result = original_update_actor(batch)
+            step = int(trainer_self.global_steps)
+            if step != last_saved_step and speco_step_matches_save_schedule(
+                step, frequency, offset
+            ):
+                logger.warning(
+                    "[SPECO checkpoint] saving shifted checkpoint at step=%s frequency=%s offset=%s",
+                    step,
+                    frequency,
+                    offset,
+                )
+                trainer_self._save_checkpoint()
+                last_saved_step = step
+            return result
+
+        try:
+            with open_dict(trainer_cfg):
+                trainer_cfg.save_freq = -1
+        except Exception:  # noqa: BLE001
+            setattr(trainer_cfg, "save_freq", -1)
+        self._update_actor = MethodType(update_actor_with_offset, self)
+        try:
+            yield
+        finally:
+            self._update_actor = original_update_actor
+            try:
+                with open_dict(trainer_cfg):
+                    trainer_cfg.save_freq = original_save_freq
+            except Exception:  # noqa: BLE001
+                setattr(trainer_cfg, "save_freq", original_save_freq)
 
     def _save_checkpoint(self):
         self._speco_save_drafter_checkpoint(wait=True)

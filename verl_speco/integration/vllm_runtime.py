@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -54,15 +55,32 @@ SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = (
     "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 )
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
+SPECO_VLLM_SPECULATIVE_TRACE_KEY = "speculative_trace"
+SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY = "speculative_trace_diagnostics"
+_SPECO_VLLM_TRACE_TRANSFER_KEY = "__speco_speculative_trace__"
+_SPECO_VLLM_TRACE_DIAGNOSTICS_TRANSFER_KEY = (
+    "__speco_speculative_trace_diagnostics__"
+)
+_SPECO_VLLM_TRACE_HEADER_KEY = "x-speco-speculative-trace"
+_SPECO_VLLM_TRACE_DIAGNOSTICS_HEADER_KEY = "x-speco-speculative-trace-diagnostics"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_TRACE_SPOOL_DIR_ENV = "VERL_SPECO_VLLM_TRACE_SPOOL_DIR"
+SPECO_VLLM_TRACE_SPOOL_DIR_DEFAULT = "/dev/shm/verl_speco_vllm_traces"
 SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
 SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
+SPECO_VLLM_ENGINE_STARTUP_LOCK_ENV = "VERL_SPECO_VLLM_ENGINE_STARTUP_LOCK"
+SPECO_VLLM_ENGINE_STARTUP_LOCK_DEFAULT = (
+    "/tmp/verl_speco_vllm_engine_startup.lock"
+)
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
 _VLLM_DSPARK_RUNTIME_PATCHED = False
 _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
 _NPU_TARGET_STAGING_STATE = threading.local()
+_VLLM_SPEC_TRACE_LOCK = threading.Lock()
+_VLLM_SPEC_TRACES_BY_REQUEST: dict[str, list[dict[str, Any]]] = {}
+_VLLM_SPEC_TRACE_DIAGNOSTICS_BY_REQUEST: dict[str, dict[str, int]] = {}
 
 _DSPARK_VLLM_ARCHITECTURES = {
     "DSparkDraftModel",
@@ -76,6 +94,28 @@ _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
     "chunked_attention",
     "linear_attention",
 )
+
+
+@contextmanager
+def _serialize_vllm_engine_startup():
+    """Prevent concurrent EngineCore processes from selecting the same port."""
+    lock_path = os.getenv(
+        SPECO_VLLM_ENGINE_STARTUP_LOCK_ENV,
+        SPECO_VLLM_ENGINE_STARTUP_LOCK_DEFAULT,
+    ).strip()
+    if not lock_path:
+        yield
+        return
+
+    import fcntl
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        logger.info("Waiting for vLLM EngineCore startup lock: %s", lock_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _speco_is_npu_vllm_worker(worker: Any) -> bool:
@@ -157,6 +197,8 @@ def _ensure_child_mapping(container: Any, key: str) -> Any:
     if child is None:
         child = {}
         _set_child(container, key, child)
+        # OmegaConf copies mappings on assignment; mutate the stored child.
+        child = _get_nested(container, (key,), None)
     return child
 
 
@@ -910,7 +952,10 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "drafter training."
         )
     if algorithm == "DSPARK":
-        return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
+        # DSpark has its own native vLLM/vLLM-Ascend proposer.  Treating it as
+        # DFlash selects a different draft-model contract on NPU and prevents
+        # the DSpark block-7 runtime from being initialized.
+        return "dspark"
 
     method_map = {
         # EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft (method="eagle");
@@ -1034,6 +1079,7 @@ def build_vllm_speculative_config_from_drafter(
         )
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
+    vllm_cfg = drafter_cfg.get("vllm") or {}
     if method in ("dflash", "dspark"):
         if method == "dflash" or algorithm == "DSPARK":
             _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=algorithm)
@@ -1059,7 +1105,6 @@ def build_vllm_speculative_config_from_drafter(
                 "must be positive for vLLM speculative decoding"
             )
 
-    vllm_cfg = drafter_cfg.get("vllm") or {}
     speculative_config: dict[str, Any] = {
         "method": method,
         "num_speculative_tokens": num_speculative_tokens,
@@ -1096,6 +1141,20 @@ def build_vllm_speculative_config_from_drafter(
             "drafter.vllm.speculative_config_overrides must be a mapping when provided"
         )
     speculative_config.update(_plain_container(overrides))
+    if algorithm == "DSPARK":
+        runtime_query_tokens = _positive_int_or_none(
+            speculative_config.get("num_speculative_tokens")
+        )
+        if runtime_query_tokens is None:
+            raise ValueError(
+                "vLLM DSpark num_speculative_tokens must remain positive after "
+                "speculative_config_overrides"
+            )
+        speculative_config["model"] = _prepare_dspark_attention_runtime_model(
+            speculative_config.get("model", spec_model_path),
+            vllm_cfg,
+            draft_query_tokens=runtime_query_tokens,
+        )
     assert_lossless_vllm_speculative_config(
         speculative_config,
         allow_lossy=bool(
@@ -1103,6 +1162,244 @@ def build_vllm_speculative_config_from_drafter(
         ),
     )
     return speculative_config
+
+
+def _prepare_dspark_attention_runtime_model(
+    model_path: Any,
+    vllm_cfg: dict[str, Any],
+    *,
+    draft_query_tokens: int,
+) -> str:
+    """Create a config-only model overlay for uniform DSpark context SWA."""
+
+    attention_mode = str(
+        vllm_cfg.get("dspark_attention_mode", "full") or "full"
+    ).strip().lower()
+    valid_modes = {"full", "swa", "hybrid", "sparse_global"}
+    if attention_mode not in valid_modes:
+        raise ValueError(
+            "drafter.vllm.dspark_attention_mode must be one of "
+            f"{sorted(valid_modes)}, got {attention_mode!r}"
+        )
+    if attention_mode in {"hybrid", "sparse_global"}:
+        raise NotImplementedError(
+            f"DSpark {attention_mode} serving is not supported by the current vLLM "
+            "DFlash KV-cache implementation: mixed full/sliding layers require "
+            "multiple cache groups. Use full or uniform swa for train-serving parity."
+        )
+    if attention_mode == "full":
+        return str(model_path)
+
+    context_window = _positive_int_or_none(vllm_cfg.get("dspark_context_window"))
+    if context_window is None:
+        raise ValueError(
+            "drafter.vllm.dspark_context_window must be positive when "
+            "dspark_attention_mode=swa"
+        )
+    query_tokens = _positive_int_or_none(draft_query_tokens)
+    if query_tokens is None:
+        raise ValueError("DSpark SWA requires a positive draft query-token count")
+    # vLLM's draft window includes the non-causal query block. The public SPECO
+    # context window counts actor-context tokens only, matching the training mask.
+    runtime_window = context_window + query_tokens
+    source_path = os.path.realpath(os.fspath(model_path))
+    source_config_path = os.path.join(source_path, "config.json")
+    if not os.path.isfile(source_config_path):
+        raise ValueError(
+            "DSpark SWA runtime overlay requires a local model directory containing "
+            f"config.json, got {model_path!r}"
+        )
+    with open(source_config_path, encoding="utf-8") as config_file:
+        source_config = json.load(config_file)
+    if not isinstance(source_config, dict):
+        raise ValueError(f"DSpark config must be a JSON object: {source_config_path}")
+
+    overlay_config = dict(source_config)
+    dflash_config = dict(overlay_config.get("dflash_config") or {})
+    dflash_config.update(
+        {
+            "use_swa": True,
+            "swa_window_size": runtime_window,
+            "causal": False,
+        }
+    )
+    overlay_config["dflash_config"] = dflash_config
+    overlay_config["sliding_window"] = runtime_window
+
+    digest_payload = json.dumps(
+        {
+            "source_path": source_path,
+            "source_config": source_config,
+            "attention_mode": attention_mode,
+            "actor_context_window": context_window,
+            "draft_query_tokens": query_tokens,
+            "runtime_window": runtime_window,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    digest = hashlib.sha256(digest_payload).hexdigest()[:20]
+    overlay_root = os.path.realpath(
+        os.fspath(
+            vllm_cfg.get("dspark_runtime_overlay_root")
+            or "/tmp/verl_speco_dspark_attention"
+        )
+    )
+    if os.path.commonpath([source_path, overlay_root]) == source_path:
+        raise ValueError(
+            "drafter.vllm.dspark_runtime_overlay_root must not be inside the "
+            f"source model directory: source={source_path}, overlay_root={overlay_root}"
+        )
+    os.makedirs(overlay_root, exist_ok=True)
+    overlay_path = os.path.join(overlay_root, digest)
+    if os.path.isfile(os.path.join(overlay_path, "config.json")):
+        return overlay_path
+
+    staging_path = f"{overlay_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    os.makedirs(staging_path, exist_ok=False)
+    try:
+        for entry in os.scandir(source_path):
+            if entry.name == "config.json":
+                continue
+            os.symlink(entry.path, os.path.join(staging_path, entry.name))
+        with open(os.path.join(staging_path, "config.json"), "w", encoding="utf-8") as output:
+            json.dump(overlay_config, output, ensure_ascii=True, indent=2, sort_keys=True)
+            output.write("\n")
+        try:
+            os.rename(staging_path, overlay_path)
+        except FileExistsError:
+            shutil.rmtree(staging_path)
+    except BaseException:
+        if os.path.isdir(staging_path):
+            shutil.rmtree(staging_path)
+        raise
+    logger.info(
+        "Prepared DSpark uniform non-causal SWA runtime overlay: source=%s "
+        "actor_context_window=%s draft_query_tokens=%s runtime_window=%s overlay=%s",
+        source_path,
+        context_window,
+        query_tokens,
+        runtime_window,
+        overlay_path,
+    )
+    return overlay_path
+
+
+def _configure_vllm_ascend_dspark_swa_window(
+    engine_kwargs: Any,
+    drafter_cfg: dict[str, Any],
+    speculative_config: dict[str, Any],
+) -> int | None:
+    """Configure the draft block-table window consumed by vLLM-Ascend."""
+
+    if _drafter_algorithm(drafter_cfg) != "DSPARK":
+        return None
+    training_cfg = drafter_cfg.get("training") or {}
+    if str(training_cfg.get("dspark_rejected_loss", "k3")).strip().lower() == "topk":
+        if not training_cfg.get("dspark_trace_aligned_anchors", False):
+            raise ValueError("DSpark rejected topk requires trace-aligned training")
+        topk = int(training_cfg.get("dspark_topk", 16))
+        if topk < 2:
+            raise ValueError("DSpark topk must be at least 2")
+        additional_config = _ensure_child_mapping(engine_kwargs, "additional_config")
+        _set_child(additional_config, "speco_dspark_rejected_topk", topk)
+        support = str(training_cfg.get("dspark_topk_support", "student")).strip().lower()
+        if support not in {"student", "union"}:
+            raise ValueError("DSpark topk_support must be student or union")
+        _set_child(additional_config, "speco_dspark_topk_support", support)
+    vllm_cfg = drafter_cfg.get("vllm") or {}
+    attention_mode = str(
+        vllm_cfg.get("dspark_attention_mode", "full") or "full"
+    ).strip().lower()
+    if attention_mode != "swa":
+        return None
+
+    context_window = _positive_int_or_none(vllm_cfg.get("dspark_context_window"))
+    query_tokens = _positive_int_or_none(
+        speculative_config.get("num_speculative_tokens")
+    )
+    if context_window is None or query_tokens is None:
+        raise ValueError(
+            "DSpark SWA requires positive dspark_context_window and "
+            "num_speculative_tokens values"
+        )
+    runtime_window = context_window + query_tokens
+
+    additional_config = _ensure_child_mapping(engine_kwargs, "additional_config")
+    if not hasattr(additional_config, "get"):
+        raise TypeError("rollout.engine_kwargs.vllm.additional_config must be a mapping")
+    existing = additional_config.get("draft_window_size")
+    if existing is not None:
+        existing_window = _positive_int_or_none(existing)
+        if existing_window != runtime_window:
+            raise ValueError(
+                "DSpark SWA requires vLLM-Ascend additional_config.draft_window_size "
+                f"to equal actor context plus draft queries ({context_window} + "
+                f"{query_tokens} = {runtime_window}), got {existing!r}"
+            )
+    else:
+        _set_child(additional_config, "draft_window_size", runtime_window)
+
+    logger.info(
+        "Configured vLLM-Ascend DSpark SWA block-table adapter: "
+        "actor_context_window=%s draft_query_tokens=%s runtime_window=%s",
+        context_window,
+        query_tokens,
+        runtime_window,
+    )
+    return runtime_window
+
+
+def _configure_dspark_swa_window_from_runtime_model(
+    engine_kwargs: dict[str, Any],
+) -> int | None:
+    """Reinforce DSpark SWA at verl's final vLLM CLI construction boundary."""
+
+    speculative_config = engine_kwargs.get("speculative_config")
+    if isinstance(speculative_config, str):
+        speculative_config = json.loads(speculative_config)
+    speculative_config = _plain_container(speculative_config)
+    if not isinstance(speculative_config, dict):
+        return None
+    if str(speculative_config.get("method", "")).strip().lower() != "dspark":
+        return None
+
+    model_path = speculative_config.get("model")
+    if model_path is None:
+        return None
+    config_path = os.path.join(os.path.realpath(os.fspath(model_path)), "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path, encoding="utf-8") as config_file:
+        model_config = json.load(config_file)
+    dflash_config = model_config.get("dflash_config") or {}
+    if not bool(_bool_or_none(dflash_config.get("use_swa", False))):
+        return None
+    runtime_window = _positive_int_or_none(dflash_config.get("swa_window_size"))
+    if runtime_window is None:
+        raise ValueError(
+            f"DSpark SWA runtime model has no positive swa_window_size: {config_path}"
+        )
+
+    additional_config = engine_kwargs.get("additional_config") or {}
+    if isinstance(additional_config, str):
+        additional_config = json.loads(additional_config)
+    additional_config = _plain_container(additional_config)
+    if not isinstance(additional_config, dict):
+        raise TypeError("vLLM additional_config must be a mapping")
+    existing = additional_config.get("draft_window_size")
+    if existing is not None and _positive_int_or_none(existing) != runtime_window:
+        raise ValueError(
+            "DSpark SWA runtime model and vLLM additional_config disagree: "
+            f"model_window={runtime_window}, draft_window_size={existing!r}"
+        )
+    additional_config["draft_window_size"] = runtime_window
+    engine_kwargs["additional_config"] = additional_config
+    logger.warning(
+        "[speco dspark swa] prepared final vLLM CLI window: runtime_window=%s",
+        runtime_window,
+    )
+    return runtime_window
 
 
 def _merge_speculative_config(
@@ -1342,6 +1639,214 @@ def _dspark_hf_config_from_proposer(proposer: Any) -> Any:
     return getattr(draft_model_cfg, "hf_config", None)
 
 
+def _validate_vllm_ascend_dspark_swa_adapter(proposer: Any) -> bool:
+    """Fail closed when a DSpark SWA model starts without block-table cropping."""
+
+    hf_config = _dspark_hf_config_from_proposer(proposer)
+    if not _is_dspark_hf_config(hf_config):
+        return False
+    dflash_config = _get_nested(hf_config, ("dflash_config",), None) or {}
+    if not bool(_bool_or_none(_get_nested(dflash_config, ("use_swa",), False))):
+        return False
+
+    expected_window = _positive_int_or_none(
+        _get_nested(dflash_config, ("swa_window_size",), None)
+    )
+    configured_window = _positive_int_or_none(
+        getattr(proposer, "draft_window_size", None)
+    )
+    adapter = getattr(proposer, "sliding_window", None)
+    adapter_window = _positive_int_or_none(getattr(adapter, "window_size", None))
+    grouped_tables = hasattr(proposer, "_per_group_block_tables")
+    grouped_builder = getattr(type(proposer), "build_draft_attn_metadata", None)
+    grouped_adapter_patched = bool(
+        getattr(grouped_builder, "_speco_dspark_grouped_swa", False)
+    )
+    if (
+        expected_window is None
+        or configured_window != expected_window
+        or adapter_window != expected_window
+        or (grouped_tables and not grouped_adapter_patched)
+    ):
+        raise RuntimeError(
+            "DSpark SWA runtime model loaded without a matching vLLM-Ascend "
+            "SlidingWindowAdapter: "
+            f"model_window={expected_window}, "
+            f"draft_window_size={configured_window}, "
+            f"adapter_window={adapter_window}, "
+            f"grouped_adapter_patched={grouped_adapter_patched}. Set "
+            "rollout.engine_kwargs.vllm.additional_config.draft_window_size to "
+            "the runtime window (actor context plus draft query tokens)."
+        )
+    logger.warning(
+        "[speco dspark swa] validated vLLM-Ascend SlidingWindowAdapter: "
+        "runtime_window=%s grouped_tables=%s",
+        expected_window,
+        int(grouped_tables),
+    )
+    return True
+
+
+def _crop_vllm_ascend_dspark_group_block_tables(proposer: Any) -> int:
+    """Apply the active SWA span to every native DSpark KV-cache group."""
+
+    adapter = getattr(proposer, "sliding_window", None)
+    if adapter is None or getattr(proposer, "draft_window_size", None) is None:
+        return 0
+    active_tables = getattr(proposer, "_per_group_block_table_buffers", None)
+    if not isinstance(active_tables, dict) or not active_tables:
+        raise RuntimeError(
+            "DSpark SWA could not find per-group block tables after input expansion"
+        )
+
+    block_size = _positive_int_or_none(getattr(adapter, "block_size", None))
+    start_tokens = getattr(adapter, "start_tokens_in_window_rounding", None)
+    windowed_seq_lens = getattr(adapter, "_windowed_seq_lens", None)
+    max_window_blocks = _positive_int_or_none(
+        getattr(adapter, "max_window_blocks", None)
+    )
+    if (
+        block_size is None
+        or start_tokens is None
+        or windowed_seq_lens is None
+        or max_window_blocks is None
+    ):
+        raise RuntimeError(
+            "DSpark SWA grouped adapter ran before the primary window was applied"
+        )
+
+    group_block_sizes = getattr(proposer, "_per_group_kernel_block_sizes", {}) or {}
+    mismatched_groups = {
+        int(group_id): int(group_size)
+        for group_id, group_size in group_block_sizes.items()
+        if _positive_int_or_none(group_size) != block_size
+    }
+    if mismatched_groups:
+        raise RuntimeError(
+            "DSpark SWA currently requires identical logical block sizes across "
+            f"draft KV-cache groups; primary={block_size}, mismatched={mismatched_groups}"
+        )
+
+    import torch
+
+    num_reqs = int(windowed_seq_lens.shape[0])
+    start_block_indices = start_tokens[:num_reqs] // block_size
+    needed_blocks = (windowed_seq_lens[:num_reqs] + block_size - 1) // block_size
+    needed_blocks = torch.clamp(needed_blocks, max=max_window_blocks).unsqueeze(1)
+    cropped_buffers = getattr(
+        proposer, "_speco_dspark_swa_group_block_table_buffers", None
+    )
+    if not isinstance(cropped_buffers, dict):
+        cropped_buffers = {}
+
+    for group_id, full_table in active_tables.items():
+        if full_table.ndim != 2 or full_table.shape[1] <= 0:
+            raise RuntimeError(
+                f"DSpark SWA received an invalid block table for group {group_id}: "
+                f"shape={tuple(full_table.shape)}"
+            )
+        output_shape = (full_table.shape[0], max_window_blocks)
+        output = cropped_buffers.get(group_id)
+        if (
+            output is None
+            or tuple(output.shape) != output_shape
+            or output.device != full_table.device
+            or output.dtype != full_table.dtype
+        ):
+            output = full_table.new_zeros(output_shape)
+            cropped_buffers[group_id] = output
+
+        columns = torch.arange(
+            max_window_blocks, device=full_table.device
+        ).unsqueeze(0)
+        source_columns = start_block_indices.unsqueeze(1) + columns
+        gathered = torch.gather(
+            full_table[:num_reqs],
+            1,
+            source_columns.clamp(max=full_table.shape[1] - 1),
+        )
+        valid = (columns < needed_blocks) & (source_columns < full_table.shape[1])
+        output[:num_reqs].copy_(gathered * valid.to(gathered.dtype))
+
+    proposer._speco_dspark_swa_group_block_table_buffers = cropped_buffers
+    proposer._per_group_block_table_buffers = {
+        group_id: cropped_buffers[group_id] for group_id in active_tables
+    }
+    if not bool(getattr(proposer, "_speco_dspark_swa_crop_logged", False)):
+        logger.warning(
+            "[speco dspark swa] applied grouped block-table crop: "
+            "runtime_window=%s block_size=%s groups=%s",
+            getattr(adapter, "window_size", None),
+            block_size,
+            len(active_tables),
+        )
+        proposer._speco_dspark_swa_crop_logged = True
+    return len(active_tables)
+
+
+def _patch_vllm_ascend_dspark_grouped_swa() -> bool:
+    try:
+        from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Unable to install native vLLM-Ascend DSpark grouped SWA adapter: %s",
+            exc,
+        )
+        return False
+
+    current = getattr(AscendDSparkProposer, "build_draft_attn_metadata", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_grouped_swa", False):
+        return True
+
+    def patched_build_draft_attn_metadata(self, *args, **kwargs):
+        if getattr(self, "draft_window_size", None) is not None:
+            _crop_vllm_ascend_dspark_group_block_tables(self)
+        return current(self, *args, **kwargs)
+
+    setattr(patched_build_draft_attn_metadata, "_speco_dspark_grouped_swa", True)
+    setattr(patched_build_draft_attn_metadata, "_speco_original_builder", current)
+    AscendDSparkProposer.build_draft_attn_metadata = patched_build_draft_attn_metadata
+    return True
+
+
+def _patch_vllm_ascend_dspark_swa_adapter_validation() -> bool:
+    try:
+        from vllm_ascend.spec_decode.llm_base_proposer import (
+            AscendSpecDecodeBaseProposer,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Unable to install vLLM-Ascend DSpark SWA adapter validation: %s", exc
+        )
+        return False
+
+    current = getattr(AscendSpecDecodeBaseProposer, "load_model", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_swa_adapter_validation", False):
+        return True
+
+    def patched_load_model(self, *args, **kwargs):
+        result = current(self, *args, **kwargs)
+        _validate_vllm_ascend_dspark_swa_adapter(self)
+        return result
+
+    setattr(
+        patched_load_model,
+        "_speco_dspark_swa_adapter_validation",
+        True,
+    )
+    setattr(
+        patched_load_model,
+        "_speco_original_load_model",
+        current,
+    )
+    AscendSpecDecodeBaseProposer.load_model = patched_load_model
+    return True
+
+
 def _patch_vllm_dspark_parallel_token() -> bool:
     try:
         from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -1557,15 +2062,22 @@ def patch_vllm_dspark_runtime() -> bool:
 
     global _VLLM_DSPARK_RUNTIME_PATCHED
 
+    patched = bool(_VLLM_DSPARK_RUNTIME_PATCHED)
+    # These adapters are also required by newer vLLM-Ascend releases with a
+    # native AscendDSparkProposer, which no longer match the PR #11153 detector.
+    patched = _patch_vllm_ascend_dspark_grouped_swa() or patched
+    patched = _patch_vllm_ascend_dspark_swa_adapter_validation() or patched
+
     ascend_has_pr11153_k_query = _vllm_ascend_has_dspark_pr11153_k_query_runtime()
     if not ascend_has_pr11153_k_query:
         logger.debug(
             "vLLM-Ascend DSpark runtime does not match PR #11153's latest K-query "
             "layout; SpeCo will not install legacy DSpark fallback patches."
         )
-        return False
+        if patched:
+            _VLLM_DSPARK_RUNTIME_PATCHED = True
+        return patched
 
-    patched = bool(_VLLM_DSPARK_RUNTIME_PATCHED)
     patched = _import_vllm_ascend_dspark_patch() or patched
     patched = _patch_vllm_dspark_parallel_token() or patched
     patched = _patch_vllm_dspark_qwen3_heads() or patched
@@ -1616,6 +2128,689 @@ def _record_vllm_spec_decode_acceptance(
     scheduler._speco_spec_decode_last_log_time = now
     scheduler._speco_spec_decode_log_drafts = 0
     scheduler._speco_spec_decode_log_accepted = 0
+
+
+def _compute_vllm_draft_teacher_logprobs(logits: Any, metadata: Any) -> Any:
+    """Gather raw target-model log-probabilities for flattened draft tokens."""
+
+    import torch
+
+    target_logits = logits[metadata.target_logits_indices].float()
+    draft_ids = metadata.draft_token_ids.long().reshape(-1)
+    if target_logits.size(0) != draft_ids.numel():
+        raise ValueError(
+            "vLLM verify logits and flattened draft token counts do not match"
+        )
+    selected_logits = target_logits.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
+    return selected_logits - torch.logsumexp(target_logits, dim=-1)
+
+
+def _build_vllm_speculative_trace_events(
+    scheduler: Any, scheduler_output: Any, model_runner_output: Any
+) -> dict[str, list[dict[str, Any]]]:
+    """Build request-aligned trace events from the actual vLLM verify step."""
+
+    scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+    sampled = getattr(model_runner_output, "sampled_token_ids", None)
+    req_id_to_index = getattr(model_runner_output, "req_id_to_index", None) or {}
+    if not scheduled or sampled is None:
+        return {}
+
+    traces: dict[str, list[dict[str, Any]]] = {}
+    for request_id, raw_draft_ids in scheduled.items():
+        verified_drafts = getattr(
+            model_runner_output,
+            "_speco_verified_draft_token_ids_by_request",
+            None,
+        )
+        verified_teacher_logprobs = getattr(
+            model_runner_output,
+            "_speco_verified_draft_teacher_logprobs_by_request",
+            None,
+        )
+        if isinstance(verified_drafts, dict):
+            raw_draft_ids = verified_drafts.get(
+                request_id, verified_drafts.get(str(request_id), raw_draft_ids)
+            )
+        if raw_draft_ids is None or request_id not in req_id_to_index:
+            continue
+        try:
+            if len(raw_draft_ids) <= 0:
+                continue
+        except TypeError:
+            continue
+        request = getattr(scheduler, "requests", {}).get(request_id)
+        is_finished = getattr(request, "is_finished", None)
+        if request is None or bool(
+            is_finished() if callable(is_finished) else is_finished
+        ):
+            continue
+        try:
+            generated_ids = [
+                int(token_id) for token_id in sampled[int(req_id_to_index[request_id])]
+            ]
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if not generated_ids:
+            continue
+
+        draft_ids = [int(token_id) for token_id in raw_draft_ids if int(token_id) >= 0]
+        draft_teacher_logprobs: list[float] = []
+        if isinstance(verified_teacher_logprobs, dict):
+            raw_teacher_logprobs = verified_teacher_logprobs.get(
+                request_id, verified_teacher_logprobs.get(str(request_id))
+            )
+            if isinstance(raw_teacher_logprobs, (list, tuple)):
+                try:
+                    draft_teacher_logprobs = [
+                        float(value) for value in raw_teacher_logprobs
+                    ][: len(draft_ids)]
+                except (TypeError, ValueError):
+                    draft_teacher_logprobs = []
+        num_sampled = max(
+            _int_or_zero(getattr(scheduler, "num_sampled_tokens_per_step", 1)), 0
+        )
+        accepted_count = min(
+            max(len(generated_ids) - num_sampled, 0), len(draft_ids)
+        )
+        all_drafts_accepted = accepted_count == len(draft_ids)
+        output_ids = getattr(request, "_output_token_ids", None)
+        if output_ids is None:
+            output_ids = getattr(request, "output_token_ids", ())
+        try:
+            response_start = len(output_ids)
+        except TypeError:
+            response_start = 0
+        traces[str(request_id)] = [
+            {
+                "response_start": int(response_start),
+                "draft_token_ids": draft_ids,
+                "draft_teacher_logprobs": draft_teacher_logprobs,
+                "verified_token_ids": generated_ids,
+                "accepted_token_ids": generated_ids[:accepted_count],
+                "accepted_count": int(accepted_count),
+                "draft_count": int(len(draft_ids)),
+                "all_drafts_accepted": bool(all_drafts_accepted),
+                "verification_token_kind": (
+                    "bonus" if all_drafts_accepted else "replacement"
+                ),
+                "rejected_draft_token_id": (
+                    draft_ids[accepted_count] if not all_drafts_accepted else None
+                ),
+                "verification_token_id": (
+                    generated_ids[accepted_count]
+                    if accepted_count < len(generated_ids)
+                    else None
+                ),
+            }
+        ]
+        topk_by_request = getattr(model_runner_output, "_speco_verified_draft_topk_by_request", {})
+        topk_payload = topk_by_request.get(str(request_id))
+        if topk_payload is not None:
+            traces[str(request_id)][0].update(topk_payload)
+    return traces
+
+
+def _build_vllm_speculative_trace_diagnostics(
+    scheduler: Any,
+    scheduler_output: Any,
+    model_runner_output: Any,
+    traces: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, int]]:
+    """Describe trace construction per request without relying on trace success."""
+
+    scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+    sampled = getattr(model_runner_output, "sampled_token_ids", None)
+    req_id_to_index = getattr(model_runner_output, "req_id_to_index", None) or {}
+    requests = getattr(scheduler, "requests", {}) or {}
+    diagnostics: dict[str, dict[str, int]] = {}
+    for request_id, raw_draft_ids in scheduled.items():
+        request_key = str(request_id)
+        verified_drafts = getattr(
+            model_runner_output,
+            "_speco_verified_draft_token_ids_by_request",
+            None,
+        )
+        verified_draft_ids = (
+            verified_drafts.get(request_id, verified_drafts.get(request_key))
+            if isinstance(verified_drafts, dict)
+            else None
+        )
+        verified_teacher_logprobs = getattr(
+            model_runner_output,
+            "_speco_verified_draft_teacher_logprobs_by_request",
+            None,
+        )
+        teacher_logprobs = (
+            verified_teacher_logprobs.get(
+                request_id, verified_teacher_logprobs.get(request_key)
+            )
+            if isinstance(verified_teacher_logprobs, dict)
+            else None
+        )
+        if verified_draft_ids is not None:
+            raw_draft_ids = verified_draft_ids
+        try:
+            draft_count = len(raw_draft_ids) if raw_draft_ids is not None else 0
+        except TypeError:
+            draft_count = 0
+        req_index = req_id_to_index.get(request_id)
+        sampled_count = 0
+        if sampled is not None and req_index is not None:
+            try:
+                sampled_count = len(sampled[int(req_index)])
+            except (IndexError, TypeError, ValueError):
+                sampled_count = 0
+        request = requests.get(request_id)
+        is_finished = getattr(request, "is_finished", None)
+        request_finished = bool(
+            is_finished() if callable(is_finished) else is_finished
+        )
+        diagnostics[request_key] = {
+            "engine_patch_active": 1,
+            "engine_scheduled_requests": 1,
+            "engine_scheduled_draft_tokens": int(max(draft_count, 0)),
+            "engine_request_present": int(request is not None),
+            "engine_request_finished": int(request_finished),
+            "engine_request_index_present": int(req_index is not None),
+            "engine_sampled_tokens": int(max(sampled_count, 0)),
+            "engine_verified_draft_ids_present": int(
+                verified_draft_ids is not None
+            ),
+            "engine_teacher_logprobs_present": int(teacher_logprobs is not None),
+            "engine_teacher_logprob_tokens": int(
+                len(teacher_logprobs)
+                if isinstance(teacher_logprobs, (list, tuple))
+                else 0
+            ),
+            "engine_built_events": int(len(traces.get(request_key, ()))),
+        }
+    return diagnostics
+
+
+def _attach_vllm_speculative_trace_events(
+    engine_outputs: Any,
+    traces: dict[str, list[dict[str, Any]]],
+    diagnostics: dict[str, dict[str, int]] | None = None,
+) -> dict[str, int]:
+    attach_stats = {
+        "engine_output_requests": 0,
+        "engine_attached_requests": 0,
+        "engine_attached_events": 0,
+        "engine_attach_misses": 0,
+    }
+    if not isinstance(engine_outputs, dict):
+        attach_stats["engine_attach_misses"] = len(diagnostics or traces)
+        return attach_stats
+    matched_requests: set[str] = set()
+    for output_group in engine_outputs.values():
+        for output in getattr(output_group, "outputs", ()) or ():
+            request_id = str(getattr(output, "request_id", ""))
+            if not request_id:
+                continue
+            attach_stats["engine_output_requests"] += 1
+            events = traces.get(request_id) or []
+            diagnostic = dict((diagnostics or {}).get(request_id) or {})
+            if not events and not diagnostic:
+                continue
+            matched_requests.add(request_id)
+            emitted_token_ids = [
+                int(token_id)
+                for token_id in (getattr(output, "new_token_ids", None) or [])
+            ]
+            events = [
+                {**event, "emitted_token_ids": emitted_token_ids} for event in events
+            ]
+            transfer = getattr(output, "kv_transfer_params", None)
+            transfer = dict(transfer) if isinstance(transfer, dict) else {}
+            if events:
+                transfer[_SPECO_VLLM_TRACE_TRANSFER_KEY] = events
+            diagnostic["engine_attached_requests"] = 1
+            diagnostic["engine_attached_events"] = len(events)
+            diagnostic["engine_emitted_tokens"] = len(emitted_token_ids)
+            transfer[_SPECO_VLLM_TRACE_DIAGNOSTICS_TRANSFER_KEY] = diagnostic
+            output.kv_transfer_params = transfer
+            trace_headers = getattr(output, "trace_headers", None)
+            trace_headers = dict(trace_headers) if trace_headers is not None else {}
+            if events:
+                trace_headers[_SPECO_VLLM_TRACE_HEADER_KEY] = json.dumps(
+                    events, separators=(",", ":")
+                )
+            trace_headers[_SPECO_VLLM_TRACE_DIAGNOSTICS_HEADER_KEY] = json.dumps(
+                diagnostic, separators=(",", ":")
+            )
+            output.trace_headers = trace_headers
+            attach_stats["engine_attached_requests"] += 1
+            attach_stats["engine_attached_events"] += len(events)
+    expected_requests = set((diagnostics or traces).keys())
+    attach_stats["engine_attach_misses"] = len(expected_requests - matched_requests)
+    return attach_stats
+
+
+def _external_vllm_request_id(request_id: Any) -> str:
+    request_id = str(request_id)
+    external_id, separator, random_suffix = request_id.rpartition("-")
+    if separator and len(random_suffix) == 8:
+        try:
+            int(random_suffix, 16)
+        except ValueError:
+            pass
+        else:
+            return external_id
+    return request_id
+
+
+def _vllm_trace_spool_path(request_id: Any) -> str:
+    spool_dir = os.getenv(
+        SPECO_VLLM_TRACE_SPOOL_DIR_ENV, SPECO_VLLM_TRACE_SPOOL_DIR_DEFAULT
+    ).strip()
+    request_digest = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()
+    return os.path.join(spool_dir, f"{request_digest}.json")
+
+
+def _write_vllm_trace_spool(
+    request_id: Any,
+    events: list[dict[str, Any]],
+    diagnostics: dict[str, int],
+) -> bool:
+    external_request_id = _external_vllm_request_id(request_id)
+    path = _vllm_trace_spool_path(external_request_id)
+    directory = os.path.dirname(path)
+    temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as output_file:
+            json.dump(
+                {
+                    "request_id": str(request_id),
+                    "external_request_id": external_request_id,
+                    "events": events,
+                    "diagnostics": diagnostics,
+                },
+                output_file,
+                separators=(",", ":"),
+            )
+        os.replace(temporary, path)
+        return True
+    except OSError as exc:
+        logger.warning("Unable to persist vLLM speculative trace spool: %s", exc)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+
+
+def _pop_vllm_trace_spool(
+    request_id: Any,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if request_id is None:
+        return [], {}
+    path = _vllm_trace_spool_path(request_id)
+    try:
+        with open(path, encoding="utf-8") as input_file:
+            payload = json.load(input_file)
+    except FileNotFoundError:
+        return [], {}
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Unable to read vLLM speculative trace spool: %s", exc)
+        payload = {}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not isinstance(payload, dict) or payload.get("external_request_id") != str(
+        request_id
+    ):
+        return [], {}
+    events = payload.get("events")
+    diagnostics = payload.get("diagnostics")
+    return (
+        list(events) if isinstance(events, list) else [],
+        dict(diagnostics) if isinstance(diagnostics, dict) else {},
+    )
+
+
+def _persist_finished_vllm_speculative_traces(
+    engine_outputs: Any,
+    pending_traces: dict[str, list[dict[str, Any]]],
+    pending_diagnostics: dict[str, dict[str, int]],
+) -> None:
+    if not isinstance(engine_outputs, dict):
+        return
+    for output_group in engine_outputs.values():
+        for output in getattr(output_group, "outputs", ()) or ():
+            if getattr(output, "finish_reason", None) is None:
+                continue
+            request_id = str(getattr(output, "request_id", ""))
+            if not request_id:
+                continue
+            events = pending_traces.pop(request_id, [])
+            diagnostics = pending_diagnostics.pop(request_id, {})
+            diagnostics["engine_spooled_events"] = len(events)
+            _write_vllm_trace_spool(request_id, events, diagnostics)
+
+
+def patch_vllm_speculative_trace_capture() -> bool:
+    """Capture real per-request draft/verify events in the EngineCore process."""
+
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM speculative trace patch: %s", exc)
+        return False
+    original = getattr(Scheduler, "update_from_output", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_speco_speculative_trace_capture", False):
+        return True
+
+    def update_from_output_with_speco_trace(
+        self, scheduler_output, model_runner_output
+    ):
+        scheduled = (
+            getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+        )
+        traces = _build_vllm_speculative_trace_events(
+            self, scheduler_output, model_runner_output
+        )
+        diagnostics = _build_vllm_speculative_trace_diagnostics(
+            self, scheduler_output, model_runner_output, traces
+        )
+        pending_traces = getattr(self, "_speco_pending_traces_by_request", None)
+        if not isinstance(pending_traces, dict):
+            pending_traces = {}
+            self._speco_pending_traces_by_request = pending_traces
+        pending_diagnostics = getattr(
+            self, "_speco_pending_trace_diagnostics_by_request", None
+        )
+        if not isinstance(pending_diagnostics, dict):
+            pending_diagnostics = {}
+            self._speco_pending_trace_diagnostics_by_request = pending_diagnostics
+        for request_id, events in traces.items():
+            pending_traces.setdefault(request_id, []).extend(events)
+        for request_id, diagnostic in diagnostics.items():
+            request_diagnostics = pending_diagnostics.setdefault(request_id, {})
+            _merge_vllm_trace_diagnostics(request_diagnostics, diagnostic)
+        result = original(self, scheduler_output, model_runner_output)
+        attach_stats = _attach_vllm_speculative_trace_events(
+            result, traces, diagnostics
+        )
+        _persist_finished_vllm_speculative_traces(
+            result, pending_traces, pending_diagnostics
+        )
+        if scheduled and bool(
+            _bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))
+        ):
+            sampled = getattr(model_runner_output, "sampled_token_ids", None) or []
+            logger.warning(
+                "[speco vllm trace boundary] scheduler=%s scheduled_requests=%s "
+                "scheduled_draft_tokens=%s sampled_rows=%s built_events=%s "
+                "output_groups=%s attached_events=%s attach_misses=%s",
+                type(self).__name__,
+                len(scheduled),
+                sum(len(tokens or ()) for tokens in scheduled.values()),
+                len(sampled),
+                sum(len(events) for events in traces.values()),
+                len(result) if isinstance(result, dict) else -1,
+                attach_stats["engine_attached_events"],
+                attach_stats["engine_attach_misses"],
+            )
+        if diagnostics:
+            totals = getattr(self, "_speco_trace_diagnostics_totals", None)
+            if not isinstance(totals, dict):
+                totals = {}
+                self._speco_trace_diagnostics_totals = totals
+            totals["built"] = int(totals.get("built", 0)) + sum(
+                len(events) for events in traces.values()
+            )
+            totals["attached"] = int(totals.get("attached", 0)) + int(
+                attach_stats["engine_attached_events"]
+            )
+            totals["attach_miss"] = int(totals.get("attach_miss", 0)) + int(
+                attach_stats["engine_attach_misses"]
+            )
+            now = time.monotonic()
+            last_log = float(getattr(self, "_speco_trace_last_log_time", 0.0))
+            interval = _float_env_or_default(
+                SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV, 10.0
+            )
+            if last_log <= 0.0 or interval <= 0.0 or now - last_log >= interval:
+                logger.info(
+                    "[speco vllm trace] engine_patch_active=1 built=%s attached=%s attach_miss=%s",
+                    totals["built"],
+                    totals["attached"],
+                    totals["attach_miss"],
+                )
+                self._speco_trace_last_log_time = now
+        return result
+
+    setattr(
+        update_from_output_with_speco_trace, "_speco_speculative_trace_capture", True
+    )
+    setattr(
+        update_from_output_with_speco_trace,
+        "_speco_original_update_from_output",
+        original,
+    )
+    Scheduler.update_from_output = update_from_output_with_speco_trace
+    return True
+
+
+def _merge_vllm_trace_diagnostics(
+    target: dict[str, int], current: dict[str, Any]
+) -> None:
+    for key, value in current.items():
+        try:
+            target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        except (TypeError, ValueError):
+            continue
+
+
+def _record_frontend_vllm_speculative_traces(engine_core_outputs: Any) -> None:
+    for output in engine_core_outputs or ():
+        transfer = getattr(output, "kv_transfer_params", None)
+        transfer = dict(transfer) if isinstance(transfer, dict) else {}
+        events = transfer.pop(_SPECO_VLLM_TRACE_TRANSFER_KEY, None)
+        diagnostic = transfer.pop(_SPECO_VLLM_TRACE_DIAGNOSTICS_TRANSFER_KEY, None)
+        trace_headers = getattr(output, "trace_headers", None)
+        trace_headers = dict(trace_headers) if trace_headers is not None else {}
+        encoded_events = trace_headers.pop(_SPECO_VLLM_TRACE_HEADER_KEY, None)
+        encoded_diagnostic = trace_headers.pop(
+            _SPECO_VLLM_TRACE_DIAGNOSTICS_HEADER_KEY, None
+        )
+        if not events and encoded_events:
+            try:
+                events = json.loads(encoded_events)
+            except (TypeError, ValueError):
+                events = None
+        if not isinstance(diagnostic, dict) and encoded_diagnostic:
+            try:
+                diagnostic = json.loads(encoded_diagnostic)
+            except (TypeError, ValueError):
+                diagnostic = None
+        output.kv_transfer_params = transfer or None
+        output.trace_headers = trace_headers or None
+        if not events and not isinstance(diagnostic, dict):
+            continue
+        request_id = _external_vllm_request_id(
+            getattr(output, "request_id", "")
+        )
+        if not request_id:
+            continue
+        with _VLLM_SPEC_TRACE_LOCK:
+            if events:
+                _VLLM_SPEC_TRACES_BY_REQUEST.setdefault(request_id, []).extend(events)
+            request_diagnostics = _VLLM_SPEC_TRACE_DIAGNOSTICS_BY_REQUEST.setdefault(
+                request_id, {}
+            )
+            if isinstance(diagnostic, dict):
+                _merge_vllm_trace_diagnostics(request_diagnostics, diagnostic)
+            request_diagnostics["frontend_received_requests"] = int(
+                request_diagnostics.get("frontend_received_requests", 0)
+            ) + 1
+            request_diagnostics["frontend_received_events"] = int(
+                request_diagnostics.get("frontend_received_events", 0)
+            ) + len(events or ())
+        if bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
+            logger.warning(
+                "[speco vllm trace boundary] frontend request_id=%s events=%s "
+                "diagnostic_keys=%s",
+                request_id,
+                len(events or ()),
+                sorted(diagnostic) if isinstance(diagnostic, dict) else [],
+            )
+
+
+def _pop_frontend_vllm_speculative_trace(request_id: Any) -> list[dict[str, Any]]:
+    with _VLLM_SPEC_TRACE_LOCK:
+        return _VLLM_SPEC_TRACES_BY_REQUEST.pop(str(request_id), [])
+
+
+def _pop_frontend_vllm_speculative_trace_diagnostics(
+    request_id: Any,
+) -> dict[str, int]:
+    with _VLLM_SPEC_TRACE_LOCK:
+        return _VLLM_SPEC_TRACE_DIAGNOSTICS_BY_REQUEST.pop(str(request_id), {})
+
+
+def patch_vllm_output_processor_speculative_trace() -> bool:
+    """Collect EngineCore trace payloads in the frontend serving the request."""
+
+    try:
+        from vllm.v1.engine.output_processor import OutputProcessor
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM trace output-processor patch: %s", exc)
+        return False
+    original = getattr(OutputProcessor, "process_outputs", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_speco_speculative_trace_capture", False):
+        return True
+
+    def process_outputs_with_speco_trace(self, engine_core_outputs, *args, **kwargs):
+        _record_frontend_vllm_speculative_traces(engine_core_outputs)
+        return original(self, engine_core_outputs, *args, **kwargs)
+
+    setattr(process_outputs_with_speco_trace, "_speco_speculative_trace_capture", True)
+    setattr(
+        process_outputs_with_speco_trace, "_speco_original_process_outputs", original
+    )
+    OutputProcessor.process_outputs = process_outputs_with_speco_trace
+    return True
+
+
+def patch_vllm_core_client_speculative_trace() -> bool:
+    """Collect trace payloads immediately after EngineCore deserialization."""
+
+    try:
+        from vllm.v1.engine.core_client import AsyncMPClient
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM trace core-client patch: %s", exc)
+        return False
+    original = getattr(AsyncMPClient, "get_output_async", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_speco_speculative_trace_capture", False):
+        return True
+
+    async def get_output_async_with_speco_trace(self, *args, **kwargs):
+        outputs = await original(self, *args, **kwargs)
+        engine_core_outputs = getattr(outputs, "outputs", None) or ()
+        _record_frontend_vllm_speculative_traces(engine_core_outputs)
+        return outputs
+
+    setattr(
+        get_output_async_with_speco_trace, "_speco_speculative_trace_capture", True
+    )
+    setattr(
+        get_output_async_with_speco_trace,
+        "_speco_original_get_output_async",
+        original,
+    )
+    AsyncMPClient.get_output_async = get_output_async_with_speco_trace
+    return True
+
+
+def patch_vllm_async_llm_speculative_trace() -> bool:
+    """Collect trace metadata from the RequestOutput stream seen by verl."""
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM AsyncLLM trace patch: %s", exc)
+        return False
+    original = getattr(AsyncLLM, "generate", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_speco_speculative_trace_capture", False):
+        return True
+
+    async def generate_with_speco_trace(self, *args, **kwargs):
+        async for request_output in original(self, *args, **kwargs):
+            _record_frontend_vllm_speculative_traces((request_output,))
+            yield request_output
+
+    setattr(generate_with_speco_trace, "_speco_speculative_trace_capture", True)
+    setattr(
+        generate_with_speco_trace,
+        "_speco_original_generate",
+        original,
+    )
+    AsyncLLM.generate = generate_with_speco_trace
+    return True
+
+
+def _install_vllm_trace_on_async_llm(engine: Any) -> bool:
+    """Install a trace collector on the concrete frontend engine instance."""
+
+    output_processor = getattr(engine, "output_processor", None)
+    original = getattr(output_processor, "process_outputs", None)
+    if output_processor is None or not callable(original):
+        return False
+    if getattr(original, "_speco_instance_trace_capture", False):
+        return True
+
+    def process_outputs_with_speco_instance_trace(
+        engine_core_outputs, *args, **kwargs
+    ):
+        _record_frontend_vllm_speculative_traces(engine_core_outputs)
+        return original(engine_core_outputs, *args, **kwargs)
+
+    setattr(
+        process_outputs_with_speco_instance_trace,
+        "_speco_instance_trace_capture",
+        True,
+    )
+    try:
+        output_processor.process_outputs = process_outputs_with_speco_instance_trace
+    except (AttributeError, TypeError):
+        processor_cls = type(output_processor)
+        class_original = getattr(processor_cls, "process_outputs", None)
+        if not callable(class_original):
+            return False
+        if getattr(class_original, "_speco_concrete_trace_capture", False):
+            return True
+
+        def process_outputs_with_speco_concrete_trace(
+            self, engine_core_outputs, *args, **kwargs
+        ):
+            _record_frontend_vllm_speculative_traces(engine_core_outputs)
+            return class_original(self, engine_core_outputs, *args, **kwargs)
+
+        setattr(
+            process_outputs_with_speco_concrete_trace,
+            "_speco_concrete_trace_capture",
+            True,
+        )
+        try:
+            processor_cls.process_outputs = process_outputs_with_speco_concrete_trace
+        except (AttributeError, TypeError):
+            return False
+    if bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
+        logger.warning("[speco vllm trace boundary] frontend_instance_hook=1")
+    return True
 
 
 def patch_vllm_spec_decode_acceptance_logging() -> bool:
@@ -1674,6 +2869,140 @@ def patch_vllm_spec_decode_acceptance_logging() -> bool:
         original,
     )
     Scheduler.make_spec_decoding_stats = patched_make_spec_decoding_stats
+    return True
+
+
+def patch_vllm_ascend_verified_draft_capture() -> bool:
+    """Return real verify draft IDs and their target-model log probabilities."""
+
+    try:
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM-Ascend draft trace patch: %s", exc)
+        return False
+
+    original_copy = getattr(NPUModelRunner, "_copy_draft_token_ids_to_cpu", None)
+    original_sample = getattr(NPUModelRunner, "sample_tokens", None)
+    original_internal_sample = getattr(NPUModelRunner, "_sample", None)
+    if not all(
+        callable(value)
+        for value in (original_copy, original_sample, original_internal_sample)
+    ):
+        return False
+    if getattr(original_sample, "_speco_verified_draft_capture", False):
+        return True
+
+    from verl_speco.integration.dspark_topk_runtime import (
+        patch_dspark_topk_capture,
+        topk_payload_by_request,
+        verified_topk_payload,
+    )
+
+    patch_dspark_topk_capture(NPUModelRunner)
+
+    def copy_draft_token_ids_for_speco_trace(
+        self, scheduler_output, zeros_only=False
+    ):
+        async_scheduling = getattr(self, "use_async_scheduling", False)
+        self.use_async_scheduling = False
+        try:
+            return original_copy(self, scheduler_output, zeros_only=zeros_only)
+        finally:
+            self.use_async_scheduling = async_scheduling
+
+    def sample_with_speco_teacher_logprobs(self, logits, spec_decode_metadata):
+        self._speco_verified_draft_topk_payload = verified_topk_payload(
+            self, logits, spec_decode_metadata
+        )
+        self._speco_verified_draft_teacher_payload = None
+        if logits is not None and spec_decode_metadata is not None:
+            try:
+                draft_ids = spec_decode_metadata.draft_token_ids.long().reshape(-1)
+                teacher_logprobs = _compute_vllm_draft_teacher_logprobs(
+                    logits, spec_decode_metadata
+                )
+                self._speco_verified_draft_teacher_payload = (
+                    self.input_batch.req_ids.copy(),
+                    list(spec_decode_metadata.num_draft_tokens),
+                    draft_ids.detach(),
+                    teacher_logprobs.detach(),
+                )
+            except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+                self._speco_verified_draft_teacher_payload = None
+        return original_internal_sample(self, logits, spec_decode_metadata)
+
+    def sample_tokens_with_speco_verified_drafts(self, *args, **kwargs):
+        verified_drafts: dict[str, list[int]] = {}
+        verified_teacher_logprobs: dict[str, list[float]] = {}
+        if getattr(self, "_draft_token_ids", None) is not None:
+            try:
+                draft_token_ids, request_ids = self._get_draft_token_ids_cpu()
+                verified_drafts = {
+                    str(request_id): [int(token_id) for token_id in token_ids]
+                    for request_id, token_ids in zip(request_ids, draft_token_ids)
+                }
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                verified_drafts = {}
+        result = original_sample(self, *args, **kwargs)
+        payload = getattr(self, "_speco_verified_draft_teacher_payload", None)
+        if isinstance(payload, tuple) and len(payload) == 4:
+            try:
+                request_ids, draft_counts, draft_ids_tensor, teacher_logprobs_tensor = (
+                    payload
+                )
+                flat_draft_ids = draft_ids_tensor.detach().cpu().tolist()
+                flat_teacher_logprobs = (
+                    teacher_logprobs_tensor.detach().float().cpu().tolist()
+                )
+                offset = 0
+                for request_id, raw_count in zip(request_ids, draft_counts):
+                    count = max(int(raw_count), 0)
+                    end = offset + count
+                    if end > len(flat_draft_ids) or end > len(flat_teacher_logprobs):
+                        break
+                    request_key = str(request_id)
+                    verified_drafts[request_key] = [
+                        int(token_id) for token_id in flat_draft_ids[offset:end]
+                    ]
+                    verified_teacher_logprobs[request_key] = [
+                        float(value) for value in flat_teacher_logprobs[offset:end]
+                    ]
+                    offset = end
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                verified_teacher_logprobs = {}
+        model_runner_output = getattr(result, "_model_runner_output", result)
+        if model_runner_output is not None:
+            model_runner_output._speco_verified_draft_topk_by_request = topk_payload_by_request(
+                getattr(self, "_speco_verified_draft_topk_payload", None)
+            )
+            model_runner_output._speco_verified_draft_token_ids_by_request = (
+                verified_drafts
+            )
+            model_runner_output._speco_verified_draft_teacher_logprobs_by_request = (
+                verified_teacher_logprobs
+            )
+        return result
+
+    setattr(
+        copy_draft_token_ids_for_speco_trace,
+        "_speco_verified_draft_capture",
+        True,
+    )
+    setattr(
+        sample_with_speco_teacher_logprobs,
+        "_speco_verified_draft_capture",
+        True,
+    )
+    setattr(
+        sample_tokens_with_speco_verified_drafts,
+        "_speco_verified_draft_capture",
+        True,
+    )
+    NPUModelRunner._copy_draft_token_ids_to_cpu = (
+        copy_draft_token_ids_for_speco_trace
+    )
+    NPUModelRunner._sample = sample_with_speco_teacher_logprobs
+    NPUModelRunner.sample_tokens = sample_tokens_with_speco_verified_drafts
     return True
 
 
@@ -1749,7 +3078,14 @@ def _speco_vllm_run_engine_core_with_acceptance_logging(*args, **kwargs):
     patch_vllm_dflash_config_aliases()
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
-    patch_vllm_spec_decode_acceptance_logging()
+    acceptance_patched = patch_vllm_spec_decode_acceptance_logging()
+    trace_patched = patch_vllm_speculative_trace_capture()
+    logger.warning(
+        "[speco vllm trace] EngineCore startup acceptance_patch=%s trace_patch=%s pid=%s",
+        int(acceptance_patched),
+        int(trace_patched),
+        os.getpid(),
+    )
     patch_vllm_worker_proc_entrypoint()
 
     from vllm.v1.engine.core import EngineCoreProc
@@ -1793,6 +3129,12 @@ def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
+    verified_draft_patched = patch_vllm_ascend_verified_draft_capture()
+    logger.warning(
+        "[speco vllm trace] worker verified_draft_patch=%s pid=%s",
+        int(verified_draft_patched),
+        os.getpid(),
+    )
 
     original = getattr(
         _speco_vllm_worker_main_with_runtime_observability,
@@ -1859,12 +3201,20 @@ def install_vllm_runtime_observability() -> bool:
     dspark_registry_patched = patch_vllm_dspark_registry_aliases()
     dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
+    trace_capture_patched = patch_vllm_speculative_trace_capture()
+    trace_client_patched = patch_vllm_core_client_speculative_trace()
+    trace_async_llm_patched = patch_vllm_async_llm_speculative_trace()
+    trace_output_patched = patch_vllm_output_processor_speculative_trace()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
     return (
         dflash_config_patched
         or dspark_registry_patched
         or dspark_runtime_patched
         or acceptance_patched
+        or trace_capture_patched
+        or trace_client_patched
+        or trace_async_llm_patched
+        or trace_output_patched
         or worker_proc_patched
     )
 
@@ -1955,11 +3305,35 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
         ),
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
+    _configure_vllm_ascend_dspark_swa_window(
+        engine_kwargs, drafter_cfg, merged_speculative_config
+    )
     if bool(merged_speculative_config.get("enforce_eager")):
         _set_child(engine_kwargs, "enforce_eager", True)
 
 
+def _preload_vllm_ascend_ops() -> bool:
+    """Initialize Ascend ops before platform quantization imports submodules."""
+    import importlib
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("vllm_ascend.ops")
+    except (ImportError, AttributeError, ValueError):
+        return False
+    if spec is None:
+        return False
+    importlib.import_module("vllm_ascend.ops")
+    return True
+
+
 class _SpecoVLLMHttpServerMixin:
+    def _preprocess_engine_kwargs(self, engine_kwargs: dict[str, Any]) -> None:
+        parent_preprocess = getattr(super(), "_preprocess_engine_kwargs", None)
+        if callable(parent_preprocess):
+            parent_preprocess(engine_kwargs)
+        _configure_dspark_swa_window_from_runtime_model(engine_kwargs)
+
     def _speco_pop_vllm_spec_decode_stats(self) -> dict[str, float]:
         stats = getattr(self, "_speco_vllm_spec_decode_pending_stats", None)
         if not isinstance(stats, dict):
@@ -1976,6 +3350,7 @@ class _SpecoVLLMHttpServerMixin:
 
     async def launch_server(self, *args, **kwargs):
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
+        _preload_vllm_ascend_ops()
         install_vllm_runtime_observability()
         _ensure_vllm_drafter_speculative_config_from_env(self.config)
         return await super().launch_server(*args, **kwargs)
@@ -2005,7 +3380,13 @@ class _SpecoVLLMHttpServerMixin:
             stat_loggers = list(call_kwargs.get("stat_loggers") or [])
             stat_loggers.append(_build_speco_vllm_stat_logger(self))
             call_kwargs["stat_loggers"] = stat_loggers
-            return original_from_vllm_config(*call_args, **call_kwargs)
+            # vLLM probes and releases a TCP port before TP workers bind it.
+            # Serializing this one-time startup closes the race between rollout
+            # replicas while leaving generation fully parallel.
+            with _serialize_vllm_engine_startup():
+                engine = original_from_vllm_config(*call_args, **call_kwargs)
+            _install_vllm_trace_on_async_llm(engine)
+            return engine
 
         if original_signature is not None:
             from_vllm_config_with_speco_stats.__signature__ = original_signature
@@ -2016,10 +3397,53 @@ class _SpecoVLLMHttpServerMixin:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
     async def generate(self, *args, **kwargs):
-        output = await super().generate(*args, **kwargs)
+        request_id = kwargs.get("request_id")
+        if request_id is None and len(args) >= 3:
+            request_id = args[2]
+        _pop_frontend_vllm_speculative_trace(request_id)
+        _pop_frontend_vllm_speculative_trace_diagnostics(request_id)
+        _pop_vllm_trace_spool(request_id)
+        try:
+            output = await super().generate(*args, **kwargs)
+        except BaseException:
+            _pop_frontend_vllm_speculative_trace(request_id)
+            _pop_frontend_vllm_speculative_trace_diagnostics(request_id)
+            _pop_vllm_trace_spool(request_id)
+            raise
+        trace = _pop_frontend_vllm_speculative_trace(request_id)
+        trace_diagnostics = _pop_frontend_vllm_speculative_trace_diagnostics(
+            request_id
+        )
+        spooled_trace, spooled_diagnostics = _pop_vllm_trace_spool(request_id)
+        if not trace:
+            trace = spooled_trace
+        if not trace_diagnostics:
+            trace_diagnostics = spooled_diagnostics
+        elif spooled_diagnostics:
+            for key, value in spooled_diagnostics.items():
+                trace_diagnostics.setdefault(key, value)
+        trace_diagnostics["server_spooled_events"] = len(spooled_trace)
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+            drafts = int(
+                extra_fields.get(
+                    f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts", 0
+                )
+                or 0
+            )
+            trace_diagnostics["server_request_id_present"] = int(
+                request_id is not None
+            )
+            trace_diagnostics["server_returned_events"] = len(trace)
+            trace_diagnostics["server_trace_match"] = int(bool(trace))
+            trace_diagnostics["server_trace_miss_with_drafts"] = int(
+                drafts > 0 and not trace
+            )
+            extra_fields[SPECO_VLLM_SPECULATIVE_TRACE_KEY] = trace
+            extra_fields[SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY] = (
+                trace_diagnostics
+            )
         return output
 
 
@@ -2119,6 +3543,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         ),
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
+    _configure_vllm_ascend_dspark_swa_window(
+        engine_kwargs, drafter_cfg, merged_speculative_config
+    )
     if bool(drafter_cfg.get("enable")):
         _set_child(
             engine_kwargs, "worker_extension_cls", SPECO_VLLM_WORKER_EXTENSION_CLS
@@ -2673,6 +4100,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                         changed = True
             if "midlayer." in n:
                 n = n.replace("midlayer.", "layers.0.")
+            # The current DSpark trainer only supports CE/L1 training; when
+            # confidence loss is disabled its frozen confidence head is not
+            # consumed by the vLLM speculative proposer.  vLLM's
+            # Qwen3DSparkModel intentionally omits that training-only module,
+            # so do not send its two parameters through strict load_weights.
+            if is_dspark and n.startswith("confidence_head."):
+                continue
             if (
                 is_eagle3
                 and n != "lm_head.weight"
@@ -2710,6 +4144,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 )
 
         self._speco_diag_draft_state("after_draft_ipc_update")
+        if loaded_params > 0:
+            # NPU hybrid rollout uses sleep(level=1), which preserves the live
+            # draft weights. Do not let a later wake-up reload replace them
+            # with the checkpoint used to bootstrap this process.
+            self._speco_live_draft_weights_loaded = True
         # One-time diagnostic: check whether probabilistic sampling is active
         proposer = self._speco_resolve_draft_proposer()
         if proposer is not None and not getattr(
@@ -2739,9 +4178,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_weights,
         )
 
-    # ----------------------------------------------------------------
-    # Fix: reload DFlash drafter weights from checkpoint after wake_up
-    # ----------------------------------------------------------------
+    # Checkpoint fallback before the first online draft-weight publication.
 
     def _speco_get_draft_checkpoint_path(self) -> str | None:
         """Resolve the DFlash drafter checkpoint path from speculative_config."""
@@ -2760,14 +4197,24 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return getattr(draft_model_cfg, "model", None)
 
     def _speco_reload_draft_from_checkpoint(self) -> int:
-        """Reload DFlash drafter weights from its checkpoint (safetensors).
+        """Reload DFlash/DSpark drafter weights from a pretrained checkpoint.
 
-        Called after target model wake_up to restore drafter weights that were
-        lost during sleep(level=2). Returns the number of weight tensors loaded.
+        GPU hybrid rollout may need this after sleep(level=2). NPU uses
+        sleep(level=1), where the bootstrapped draft model remains resident
+        across wake-up and target-model synchronization. Loading a full draft
+        checkpoint in every NPU TP rank is therefore both unnecessary and a
+        substantial host-memory spike.
         """
         import glob as _glob
 
         if not self._speco_is_dflash_draft():
+            return 0
+
+        # Ascend hybrid rollout uses sleep(level=1), which preserves the
+        # initial checkpoint load and subsequently published IPC weights. The
+        # normal vLLM model loader already handles the checkpoint at process
+        # startup; do not re-read it after every target sync.
+        if _speco_is_npu_vllm_worker(self):
             return 0
 
         draft_model, _ = self._speco_resolve_draft_model()
@@ -2782,24 +4229,87 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
             return 0
 
-        st_files = sorted(_glob.glob(os.path.join(ckpt_path, "*.safetensors")))
-        if not st_files:
+        def _load_state_file(path: str) -> dict[str, Any]:
+            if path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                return load_file(path, device="cpu")
+
+            import torch
+
+            try:
+                state_dict = torch.load(
+                    path, map_location="cpu", weights_only=True, mmap=True
+                )
+            except (RuntimeError, TypeError):
+                # mmap is unavailable for a few legacy PyTorch archives.
+                state_dict = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(state_dict, dict):
+                raise TypeError(
+                    f"Expected a state dict in {path}, got {type(state_dict).__name__}"
+                )
+            return state_dict
+
+        index_paths = sorted(_glob.glob(os.path.join(ckpt_path, "*.index.json")))
+        weight_files: list[str] = []
+        if index_paths:
+            if len(index_paths) != 1:
+                logger.warning(
+                    "[speco draft reload] multiple checkpoint indexes in %s, skip",
+                    ckpt_path,
+                )
+                return 0
+            try:
+                with open(index_paths[0], "r", encoding="utf-8") as stream:
+                    weight_map = json.load(stream).get("weight_map", {})
+            except (OSError, json.JSONDecodeError, AttributeError) as exc:
+                logger.warning(
+                    "[speco draft reload] invalid checkpoint index %s: %s",
+                    index_paths[0],
+                    exc,
+                )
+                return 0
+            if not isinstance(weight_map, dict) or not weight_map:
+                logger.warning(
+                    "[speco draft reload] empty checkpoint index %s, skip", index_paths[0]
+                )
+                return 0
+            checkpoint_root = os.path.realpath(ckpt_path)
+            for filename in sorted(set(weight_map.values())):
+                if not isinstance(filename, str):
+                    logger.warning(
+                        "[speco draft reload] invalid shard name in %s, skip",
+                        index_paths[0],
+                    )
+                    return 0
+                shard_path = os.path.realpath(os.path.join(ckpt_path, filename))
+                if os.path.commonpath((checkpoint_root, shard_path)) != checkpoint_root:
+                    logger.warning(
+                        "[speco draft reload] shard outside checkpoint path in %s, skip",
+                        index_paths[0],
+                    )
+                    return 0
+                weight_files.append(shard_path)
+        else:
+            safe_files = sorted(_glob.glob(os.path.join(ckpt_path, "*.safetensors")))
+            bin_files = sorted(_glob.glob(os.path.join(ckpt_path, "*.bin")))
+            # Prefer safetensors when both forms are intentionally retained.
+            weight_files = safe_files or bin_files
+
+        if not weight_files:
             logger.warning(
-                "[speco draft reload] no safetensors files in %s, skip", ckpt_path
+                "[speco draft reload] no supported weight files in %s, skip", ckpt_path
             )
             return 0
 
-        try:
-            from safetensors.torch import load_file
-        except ImportError:
-            logger.warning("[speco draft reload] safetensors not available, skip")
-            return 0
-
         weights_iter = []
-        for st_file in st_files:
-            state_dict = load_file(st_file, device="cpu")
-            for name, tensor in state_dict.items():
-                weights_iter.append((name, tensor))
+        try:
+            for weight_file in weight_files:
+                state_dict = _load_state_file(weight_file)
+                weights_iter.extend(state_dict.items())
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("[speco draft reload] failed to read %s: %s", ckpt_path, exc)
+            return 0
 
         if not weights_iter:
             logger.warning("[speco draft reload] checkpoint empty, skip")
@@ -2811,6 +4321,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         except Exception as exc:
             logger.warning("[speco draft reload] load_weights failed: %s", exc)
             return 0
+        finally:
+            weights_iter.clear()
 
         return loaded_count
 

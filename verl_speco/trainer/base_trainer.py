@@ -15,6 +15,7 @@ import logging
 import json
 import os
 import glob
+import math
 import time
 import asyncio
 import random
@@ -50,7 +51,13 @@ from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
 )
-from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
+from verl_speco.trainer.checkpoint import (
+    release_checkpoint_host_memory,
+    rewrite_block_drafter_runtime_config,
+)
+from verl_speco.trainer.dspark_training_config import (
+    dspark_target_distribution_loss_enabled,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
@@ -95,6 +102,21 @@ def alignment_debug_enabled() -> bool:
 
 def last_hidden_logprob_check_enabled() -> bool:
     return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+
+
+def _weighted_histogram_median(histogram: list[float], max_value: float) -> float:
+    """Approximate a weighted median using the lower edge of its histogram bin."""
+
+    total = sum(max(float(value), 0.0) for value in histogram)
+    if total <= 0 or not histogram or max_value <= 0:
+        return 0.0
+    threshold = total * 0.5
+    cumulative = 0.0
+    for index, value in enumerate(histogram):
+        cumulative += max(float(value), 0.0)
+        if cumulative >= threshold:
+            return float(index) * float(max_value) / float(len(histogram))
+    return float(max_value)
 
 
 def alignment_debug_every_n_steps() -> int:
@@ -260,6 +282,43 @@ def _batch_item_int(value: Any, index: int = 0) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _has_mappable_verify_event(item: dict[str, Any]) -> bool:
+    """Return whether a trace contains a verify start inside this feature window."""
+
+    trace = item.get("speculative_trace")
+    input_ids = item.get("input_ids")
+    if not isinstance(trace, (list, tuple)) or not torch.is_tensor(input_ids):
+        return False
+    try:
+        prompt_len = int(item.get("_verl_prompt_len", 0) or 0)
+        feature_start = int(item.get("_verl_feature_start", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    feature_end = feature_start + int(input_ids.numel())
+    if prompt_len <= 0 or feature_end - feature_start <= 1:
+        return False
+    for event in trace:
+        if not isinstance(event, dict):
+            continue
+        try:
+            trajectory_start = event.get("trajectory_response_start")
+            generation_index = int(event.get("generation_index", 0) or 0)
+            if trajectory_start is None and generation_index > 0:
+                continue
+            response_start = int(
+                event.get("response_start", -1)
+                if trajectory_start is None
+                else trajectory_start
+            )
+            draft_count = int(event.get("draft_count", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        anchor = prompt_len - 1 + response_start
+        if draft_count > 0 and feature_start <= anchor < feature_end - 1:
+            return True
+    return False
 
 
 def _batch_item_float(value: Any, index: int = 0) -> float | None:
@@ -547,6 +606,17 @@ class DrafterBaseTrainer:
         self._pending_publish_state_dict: dict[str, Any] | None = None
         self._pending_publish_step: int | None = None
         self._pending_publish_ready = False
+        # Candidate updates are transactional: keep the pre-update publish
+        # payload on the global leader and cheap local parameter shards on every
+        # training rank until rollout validation commits or rejects the update.
+        self._candidate_baseline_state_dict: dict[str, Any] | None = None
+        self._candidate_trained_state_dict: dict[str, Any] | None = None
+        self._candidate_local_baseline: dict[str, torch.Tensor] | None = None
+        self._candidate_step: int | None = None
+        self._candidate_training_steps: int | None = None
+        self._candidate_optimizer_steps_total: int | None = None
+        self._candidate_scheduler_state: dict[str, Any] | None = None
+        self._candidate_optimizer_lrs: list[float] | None = None
         self.model: Any = None
         self.optimizer: Any = None
         self.lr_scheduler: Any = None
@@ -559,8 +629,51 @@ class DrafterBaseTrainer:
         self._training_timing_accumulator: dict[str, float] = {}
         self._training_timing_steps = 0
         self._training_metric_sums: dict[str, float] = {}
+        self._training_metric_extrema: dict[str, float] = {}
         self._training_metric_steps = 0
+        self._training_sample_draws = 0
+        self._training_unique_sample_ids: set[str] = set()
+        self._training_mesh_batch_skips = 0
+        self._training_batch_prepare_failures = 0
+        self._k3_dump_files = 0
+        self._k3_dump_tokens = 0
+        self._k3_dump_failures = 0
+        self._k3_dump_sequence = 0
+        self.dspark_dump_k3_logprobs = bool(
+            training_cfg.get("dspark_dump_k3_logprobs", False)
+        )
+        configured_dump_dir = training_cfg.get("dspark_dump_k3_logprobs_dir", None)
+        self.dspark_dump_k3_logprobs_dir = str(
+            configured_dump_dir
+            or os.getenv("SPECO_DRAFTER_K3_DUMP_DIR", "")
+            or os.path.join(
+                os.getenv("CKPTS_DIR", "."), "drafter_analysis", "k3_logprobs"
+            )
+        )
+        self.dspark_dump_k3_logprobs_interval_steps = max(
+            int(
+                training_cfg.get(
+                    "dspark_dump_k3_logprobs_interval_steps", 1
+                )
+                or 1
+            ),
+            1,
+        )
+        self.dspark_dump_k3_logprobs_max_tokens_per_stream = max(
+            int(
+                training_cfg.get(
+                    "dspark_dump_k3_logprobs_max_tokens_per_stream", 0
+                )
+                or 0
+            ),
+            0,
+        )
         self._frozen_param_names = {"model.embed_tokens.weight"}
+        self.fixed_eval_samples_per_replica = max(
+            int(training_cfg.get("fixed_eval_samples_per_replica", 0) or 0), 0
+        )
+        self.fixed_eval_data: list[dict[str, Any]] = []
+        self.fixed_eval_source_step: int | None = None
 
         # Ulysses Sequence Parallelism configuration. EAGLE3 can slice
         # token-wise training tensors by the rollout TP size, but DFlash anchor
@@ -668,7 +781,15 @@ class DrafterBaseTrainer:
 
     def reset_training_metrics(self) -> None:
         self._training_metric_sums = {}
+        self._training_metric_extrema = {}
         self._training_metric_steps = 0
+        self._training_sample_draws = 0
+        self._training_unique_sample_ids = set()
+        self._training_mesh_batch_skips = 0
+        self._training_batch_prepare_failures = 0
+        self._k3_dump_files = 0
+        self._k3_dump_tokens = 0
+        self._k3_dump_failures = 0
 
     def get_training_metrics(self) -> dict[str, float]:
         sums = dict(self._training_metric_sums)
@@ -695,26 +816,203 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/ce_loss"] = (
                 sums.get(f"{prefix}/ce_loss_sum", 0.0) / ce_tokens
             )
+        first_ce_tokens = sums.get(f"{prefix}/first_rejection_ce_token_count", 0.0)
+        if first_ce_tokens > 0:
+            first_ce = sums.get(f"{prefix}/first_rejection_ce_loss_sum", 0.0) / first_ce_tokens
+            metrics[f"{prefix}/first_rejection_ce_loss"] = first_ce
+            metrics[f"{prefix}/first_rejection_ce_q_prob"] = (
+                sums.get(f"{prefix}/first_rejection_ce_q_prob_sum", 0.0) / first_ce_tokens
+            )
+            alpha = sums.get(f"{prefix}/first_rejection_ce_alpha", 0.0) / max(
+                sums.get(f"{prefix}/metric_replica_count", 0.0), 1.0
+            )
+            metrics[f"{prefix}/first_rejection_ce_contribution"] = alpha * first_ce
         l1_tokens = sums.get(f"{prefix}/l1_weighted_token_count", 0.0)
         if l1_tokens > 0:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        accepted_fkl_tokens = sums.get(
+            f"{prefix}/accepted_fkl_weighted_count", 0.0
+        )
+        if accepted_fkl_tokens > 0:
+            metrics[f"{prefix}/accepted_fkl"] = (
+                sums.get(f"{prefix}/accepted_fkl_sum", 0.0) / accepted_fkl_tokens
+            )
+            metrics[f"{prefix}/accepted_q_prob"] = (
+                sums.get(f"{prefix}/accepted_q_prob_sum", 0.0)
+                / accepted_fkl_tokens
+            )
+            metrics[f"{prefix}/accepted_p_prob"] = (
+                sums.get(f"{prefix}/accepted_p_prob_sum", 0.0)
+                / accepted_fkl_tokens
+            )
+            metrics[f"{prefix}/accepted_log_ratio"] = (
+                sums.get(f"{prefix}/accepted_log_ratio_sum", 0.0)
+                / accepted_fkl_tokens
+            )
+        accepted_k3_tokens = sums.get(
+            f"{prefix}/accepted_k3_weighted_count", 0.0
+        )
+        for stream in ("response", "rejected"):
+            count = sums.get(f"{prefix}/{stream}_topk_weighted_count", 0.0)
+            if count > 0:
+                for metric in ("loss", "student_mass", "teacher_mass", "support_size"):
+                    metrics[f"{prefix}/{stream}_topk_{metric}"] = (
+                        sums.get(f"{prefix}/{stream}_topk_{metric}_sum", 0.0) / count
+                    )
+        if accepted_k3_tokens > 0:
+            accepted_k3_mean = (
+                sums.get(f"{prefix}/accepted_k3_sum", 0.0) / accepted_k3_tokens
+            )
+            metrics[f"{prefix}/accepted_k3"] = accepted_k3_mean
+            metrics[f"{prefix}/accepted_k3_mean"] = accepted_k3_mean
+            metrics[f"{prefix}/accepted_k3_clamp_ratio"] = (
+                sums.get(f"{prefix}/accepted_k3_clamped_count", 0.0)
+                / accepted_k3_tokens
+            )
+            metrics[f"{prefix}/accepted_k3_legacy_clamp_exceed_ratio"] = metrics[
+                f"{prefix}/accepted_k3_clamp_ratio"
+            ]
+            metrics[f"{prefix}/accepted_k3_linearized_ratio"] = (
+                sums.get(f"{prefix}/accepted_k3_linearized_count", 0.0)
+                / accepted_k3_tokens
+            )
+            self._add_k3_distribution_metrics(metrics, sums, prefix, "accepted")
+        rejection_tokens = sums.get(f"{prefix}/rejected_k3_weighted_count", 0.0)
+        if rejection_tokens > 0:
+            rejected_k3_mean = (
+                sums.get(f"{prefix}/rejected_k3_sum", 0.0) / rejection_tokens
+            )
+            metrics[f"{prefix}/rejected_k3"] = rejected_k3_mean
+            metrics[f"{prefix}/rejected_k3_mean"] = rejected_k3_mean
+            metrics[f"{prefix}/rejected_q_prob"] = (
+                sums.get(f"{prefix}/rejected_q_prob_sum", 0.0) / rejection_tokens
+            )
+            metrics[f"{prefix}/rejected_p_prob"] = (
+                sums.get(f"{prefix}/rejected_p_prob_sum", 0.0) / rejection_tokens
+            )
+            metrics[f"{prefix}/rejected_teacher_minus_draft_log_ratio"] = (
+                sums.get(
+                    f"{prefix}/rejected_teacher_minus_draft_log_ratio_sum", 0.0
+                )
+                / rejection_tokens
+            )
+            metrics[f"{prefix}/rejected_k3_clamp_ratio"] = (
+                sums.get(f"{prefix}/rejected_k3_clamped_count", 0.0)
+                / rejection_tokens
+            )
+            metrics[f"{prefix}/rejected_k3_legacy_clamp_exceed_ratio"] = metrics[
+                f"{prefix}/rejected_k3_clamp_ratio"
+            ]
+            metrics[f"{prefix}/rejected_k3_linearized_ratio"] = (
+                sums.get(f"{prefix}/rejected_k3_linearized_count", 0.0)
+                / rejection_tokens
+            )
+            self._add_k3_distribution_metrics(metrics, sums, prefix, "rejected")
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
+            f"{prefix}/first_rejection_ce_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/accepted_fkl_weighted_count",
+            f"{prefix}/accepted_k3_weighted_count",
+            f"{prefix}/rejected_k3_weighted_count",
+            f"{prefix}/objective_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
             f"{prefix}/sampled_vocab_size",
             f"{prefix}/loss_mode_id",
+            f"{prefix}/trace_anchor_count",
+            f"{prefix}/trace_accepted_position_count",
+            f"{prefix}/trace_first_rejection_count",
+            f"{prefix}/trace_unverified_suffix_count",
+            f"{prefix}/trace_all_accepted_anchor_count",
+            f"{prefix}/trace_bonus_response_position_count",
         ):
             if key in sums:
                 metrics[key] = sums[key] / steps
+        metric_replica_count = sums.get(f"{prefix}/metric_replica_count", 0.0)
+        if metric_replica_count > 0:
+            for metric_name in (
+                "response_topk_enabled",
+                "rejected_topk_enabled",
+                "topk_union_enabled",
+                "first_rejection_ce_enabled",
+                "first_rejection_ce_alpha",
+                "asymmetric_k3_enabled",
+                "accepted_asymmetric_k3_enabled",
+                "rejected_asymmetric_k3_enabled",
+                "asymmetric_k3_positive_threshold",
+                "dynamic_accept_reject_weighting_enabled",
+                "response_stream_effective_weight",
+                "rejected_stream_effective_weight",
+                "response_stream_weight_multiplier",
+                "rejected_stream_weight_multiplier",
+            ):
+                key = f"{prefix}/{metric_name}"
+                if key in sums:
+                    metrics[key] = sums[key] / metric_replica_count
+        absolute_anchor_count = sums.get(
+            f"{prefix}/absolute_anchor_position_count", 0.0
+        )
+        if absolute_anchor_count > 0:
+            metrics[f"{prefix}/absolute_anchor_position_mean"] = (
+                sums.get(f"{prefix}/absolute_anchor_position_sum", 0.0)
+                / absolute_anchor_count
+            )
+            metrics[f"{prefix}/local_context_tokens_mean"] = (
+                sums.get(f"{prefix}/local_context_token_count_sum", 0.0)
+                / absolute_anchor_count
+            )
+        for bucket_index, bucket_name in enumerate(
+            ("0_511", "512_1023", "1024_2047", "2048_plus")
+        ):
+            bucket_key = f"{prefix}/absolute_anchor_bucket_counts/{bucket_index}"
+            if bucket_key in sums:
+                metrics[f"{prefix}/absolute_anchor_bucket/{bucket_name}"] = sums[
+                    bucket_key
+                ] / steps
         metrics[f"{prefix}/metric_steps"] = float(self._training_metric_steps)
         metrics["drafter/optimizer_steps_total"] = float(self.optimizer_steps_total)
+        scalar_steps = max(int(sums.get("drafter/train_scalar_steps", 0.0)), 1)
+        for metric_name in ("loss", "vloss", "ploss", "grad_norm"):
+            sum_key = f"drafter/train_{metric_name}_sum"
+            if sum_key in sums:
+                metrics[f"drafter/train_{metric_name}"] = sums[sum_key] / scalar_steps
+        if "drafter/train_token_count" in sums:
+            metrics["drafter/train_token_count"] = sums[
+                "drafter/train_token_count"
+            ]
+        sample_draws = int(getattr(self, "_training_sample_draws", 0) or 0)
+        unique_samples = len(
+            getattr(self, "_training_unique_sample_ids", set()) or set()
+        )
+        metrics["drafter/train_sample_draws"] = float(sample_draws)
+        metrics["drafter/train_unique_samples"] = float(unique_samples)
+        metrics["drafter/train_sample_reuse_ratio"] = (
+            max(1.0 - unique_samples / sample_draws, 0.0)
+            if sample_draws > 0
+            else 0.0
+        )
+        metrics["drafter/mesh_batch_skips"] = float(
+            getattr(self, "_training_mesh_batch_skips", 0) or 0
+        )
+        metrics["drafter/batch_prepare_failures"] = float(
+            getattr(self, "_training_batch_prepare_failures", 0) or 0
+        )
+        if getattr(self, "dspark_dump_k3_logprobs", False):
+            metrics["drafter/k3_dump_files"] = float(
+                getattr(self, "_k3_dump_files", 0)
+            )
+            metrics["drafter/k3_dump_tokens"] = float(
+                getattr(self, "_k3_dump_tokens", 0)
+            )
+            metrics["drafter/k3_dump_failures"] = float(
+                getattr(self, "_k3_dump_failures", 0)
+            )
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
 
@@ -729,6 +1027,33 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/loss_per_position/{pos}"] = loss_sum / count
             metrics[f"{prefix}/accuracy_per_position/{pos}"] = correct_sum / count
         return metrics
+
+    def _add_k3_distribution_metrics(
+        self,
+        metrics: dict[str, float],
+        sums: dict[str, float],
+        prefix: str,
+        stream: str,
+    ) -> None:
+        bins = max(
+            int(self._block_drafter_config_value("k3_distribution_bins", 512)), 1
+        )
+        histogram = [
+            sums.get(f"{prefix}/{stream}_k3_histogram/{index}", 0.0)
+            for index in range(bins)
+        ]
+        max_value = float(
+            self._block_drafter_config_value("rejected_loss_max_clamp", 10.0)
+        )
+        metrics[f"{prefix}/{stream}_k3_median"] = _weighted_histogram_median(
+            histogram, max_value
+        )
+        for statistic in ("min", "max"):
+            value = getattr(self, "_training_metric_extrema", {}).get(
+                f"{prefix}/{stream}_k3_{statistic}"
+            )
+            if value is not None and math.isfinite(value):
+                metrics[f"{prefix}/{stream}_k3_{statistic}"] = value
 
     def record_training_timing(self, metric_name: str, elapsed_sec: float) -> None:
         if elapsed_sec < 0:
@@ -765,49 +1090,258 @@ class DrafterBaseTrainer:
             return
         self._training_metric_steps += 1
         prefix = self._block_drafter_metric_prefix()
-        scalar_keys = {
-            "correct_count": f"{prefix}/correct_count",
-            "eval_token_count": f"{prefix}/eval_token_count",
-            "top1_correct_count": f"{prefix}/top1_correct_count",
-            "top5_correct_count": f"{prefix}/top5_correct_count",
-            "quality_token_count": f"{prefix}/quality_token_count",
-            "valid_token_count": f"{prefix}/valid_token_count",
-            "weighted_token_count": f"{prefix}/weighted_token_count",
-            "ce_loss_sum": f"{prefix}/ce_loss_sum",
-            "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
-            "l1_loss_sum": f"{prefix}/l1_loss_sum",
-            "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
-            "sanitized_rows": f"{prefix}/sanitized_rows",
-            "masked_rows": f"{prefix}/masked_rows",
-            "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
-            "loss_mode_id": f"{prefix}/loss_mode_id",
-        }
-        for source_key, metric_key in scalar_keys.items():
+        scalar_keys = (
+            "response_topk_enabled",
+            "rejected_topk_enabled",
+            "topk_union_enabled",
+            "response_topk_loss_sum",
+            "response_topk_weighted_count",
+            "response_topk_student_mass_sum",
+            "response_topk_teacher_mass_sum",
+            "response_topk_support_size_sum",
+            "rejected_topk_loss_sum",
+            "rejected_topk_weighted_count",
+            "rejected_topk_student_mass_sum",
+            "rejected_topk_teacher_mass_sum",
+            "rejected_topk_support_size_sum",
+            "correct_count",
+            "eval_token_count",
+            "top1_correct_count",
+            "top5_correct_count",
+            "quality_token_count",
+            "valid_token_count",
+            "weighted_token_count",
+            "ce_loss_sum",
+            "ce_weighted_token_count",
+            "first_rejection_ce_enabled",
+            "first_rejection_ce_alpha",
+            "first_rejection_ce_loss_sum",
+            "first_rejection_ce_token_count",
+            "first_rejection_ce_q_prob_sum",
+            "l1_loss_sum",
+            "l1_weighted_token_count",
+            "accepted_fkl_sum",
+            "accepted_fkl_weighted_count",
+            "accepted_k3_sum",
+            "accepted_k3_weighted_count",
+            "accepted_k3_clamped_count",
+            "accepted_k3_linearized_count",
+            "accepted_q_prob_sum",
+            "accepted_p_prob_sum",
+            "accepted_log_ratio_sum",
+            "rejected_k3_sum",
+            "rejected_k3_weighted_count",
+            "rejected_q_prob_sum",
+            "rejected_p_prob_sum",
+            "rejected_teacher_minus_draft_log_ratio_sum",
+            "rejected_k3_clamped_count",
+            "rejected_k3_linearized_count",
+            "asymmetric_k3_enabled",
+            "accepted_asymmetric_k3_enabled",
+            "rejected_asymmetric_k3_enabled",
+            "asymmetric_k3_positive_threshold",
+            "dynamic_accept_reject_weighting_enabled",
+            "response_stream_effective_weight",
+            "rejected_stream_effective_weight",
+            "response_stream_weight_multiplier",
+            "rejected_stream_weight_multiplier",
+            "metric_replica_count",
+            "response_objective_sum",
+            "rejected_objective_sum",
+            "objective_weighted_token_count",
+            "trace_anchor_count",
+            "trace_accepted_position_count",
+            "trace_first_rejection_count",
+            "trace_unverified_suffix_count",
+            "trace_all_accepted_anchor_count",
+            "trace_bonus_response_position_count",
+            "sanitized_rows",
+            "masked_rows",
+            "sampled_vocab_size",
+            "loss_mode_id",
+            "absolute_anchor_position_sum",
+            "absolute_anchor_position_count",
+            "local_context_token_count_sum",
+        )
+        position_count = max(
+            int(self._block_drafter_config_value("block_size", 16)), 1
+        )
+        distribution_bins = max(
+            int(self._block_drafter_config_value("k3_distribution_bins", 512)), 1
+        )
+        vector_specs = (
+            ("loss_sum_per_position", position_count),
+            ("correct_per_position", position_count),
+            ("count_per_position", position_count),
+            ("accepted_k3_histogram", distribution_bins),
+            ("rejected_k3_histogram", distribution_bins),
+            ("absolute_anchor_bucket_counts", 4),
+        )
+
+        # Diagnostics are reported after every drafter microstep.  Reducing each
+        # scalar independently created 18 HCCL collectives per step (15 scalars
+        # plus 3 vectors), interleaved with FSDP collectives.  Keep the exact
+        # sums but use a fixed-shape packed reduction so every rank issues one
+        # collective in the same order even when a diagnostic is absent locally.
+        metric_device = next(
+            (
+                value.device
+                for value in diagnostics.values()
+                if torch.is_tensor(value)
+            ),
+            self.runtime_device,
+        )
+        packed_parts: list[torch.Tensor] = []
+        for source_key in scalar_keys:
             value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
-                continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value.reshape(()))
+            if torch.is_tensor(value) and int(value.numel()) > 0:
+                packed_parts.append(value.detach().float().reshape(-1)[:1])
+            else:
+                packed_parts.append(
+                    torch.zeros(1, device=metric_device, dtype=torch.float32)
+                )
+        for source_key, width in vector_specs:
+            value = diagnostics.get(source_key)
+            if torch.is_tensor(value):
+                vector = value.detach().float().reshape(-1)
+            else:
+                vector = torch.empty(0, device=metric_device, dtype=torch.float32)
+            if int(vector.numel()) < width:
+                vector = torch.nn.functional.pad(
+                    vector, (0, width - int(vector.numel()))
+                )
+            packed_parts.append(vector[:width])
+
+        packed = torch.cat(packed_parts)
+        reduced = self._reduce_training_metric(packed).detach().cpu().tolist()
+        offset = 0
+        for source_key in scalar_keys:
+            metric_key = f"{prefix}/{source_key}"
             self._training_metric_sums[metric_key] = self._training_metric_sums.get(
                 metric_key, 0.0
-            ) + float(reduced.cpu().item())
-
-        vector_keys = {
-            "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
-            "correct_per_position": f"{prefix}/correct_per_position",
-            "count_per_position": f"{prefix}/count_per_position",
-        }
-        for source_key, metric_prefix in vector_keys.items():
-            value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
-                continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value)
-            for idx, item in enumerate(reduced.detach().cpu().tolist()):
+            ) + float(reduced[offset])
+            offset += 1
+        for source_key, width in vector_specs:
+            metric_prefix = f"{prefix}/{source_key}"
+            for idx in range(width):
                 metric_key = f"{metric_prefix}/{idx}"
                 self._training_metric_sums[metric_key] = self._training_metric_sums.get(
                     metric_key, 0.0
-                ) + float(item)
+                ) + float(reduced[offset + idx])
+            offset += width
+
+        extrema = getattr(self, "_training_metric_extrema", None)
+        if extrema is None:
+            extrema = {}
+            self._training_metric_extrema = extrema
+        for stream in ("accepted", "rejected"):
+            for statistic in ("min", "max"):
+                source_key = f"{stream}_k3_{statistic}"
+                value = diagnostics.get(source_key)
+                if not torch.is_tensor(value) or int(value.numel()) == 0:
+                    continue
+                scalar = float(value.detach().float().cpu().reshape(-1)[0].item())
+                if not math.isfinite(scalar):
+                    continue
+                metric_key = f"{prefix}/{source_key}"
+                previous = extrema.get(metric_key)
+                if previous is None:
+                    extrema[metric_key] = scalar
+                elif statistic == "min":
+                    extrema[metric_key] = min(previous, scalar)
+                else:
+                    extrema[metric_key] = max(previous, scalar)
+
+    def _maybe_dump_dspark_k3_logprobs(
+        self,
+        loss_dict: dict[str, Any],
+        rl_step: int,
+        optimizer_step: int | None = None,
+    ) -> None:
+        if not getattr(self, "dspark_dump_k3_logprobs", False):
+            return
+        diagnostics = loss_dict.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return
+        stream_payloads = diagnostics.pop("k3_logprob_dump", None)
+        if not isinstance(stream_payloads, dict):
+            return
+
+        self._k3_dump_sequence += 1
+        optimizer_step = (
+            int(optimizer_step)
+            if optimizer_step is not None
+            else int(self.optimizer_steps_total) + 1
+        )
+        if optimizer_step % self.dspark_dump_k3_logprobs_interval_steps != 0:
+            return
+
+        max_tokens = self.dspark_dump_k3_logprobs_max_tokens_per_stream
+        cpu_streams: dict[str, dict[str, torch.Tensor]] = {}
+        total_tokens = 0
+        for stream in ("accepted", "rejected"):
+            values = stream_payloads.get(stream)
+            if not isinstance(values, dict):
+                continue
+            tensor_values = {
+                key: value.detach().cpu()
+                for key, value in values.items()
+                if torch.is_tensor(value)
+            }
+            token_ids = tensor_values.get("token_ids")
+            stream_tokens = int(token_ids.numel()) if token_ids is not None else 0
+            if max_tokens > 0 and stream_tokens > max_tokens:
+                selected_indices = torch.linspace(
+                    0,
+                    stream_tokens - 1,
+                    steps=max_tokens,
+                    dtype=torch.float64,
+                ).round().long()
+                tensor_values = {
+                    key: value.index_select(0, selected_indices)
+                    if value.ndim > 0 and int(value.size(0)) == stream_tokens
+                    else value
+                    for key, value in tensor_values.items()
+                }
+                stream_tokens = max_tokens
+            cpu_streams[stream] = tensor_values
+            total_tokens += stream_tokens
+
+        global_rank = dist.get_rank() if dist.is_initialized() else int(self.rank)
+        step_dir = os.path.join(
+            self.dspark_dump_k3_logprobs_dir, f"rl_step_{int(rl_step):06d}"
+        )
+        output_path = os.path.join(
+            step_dir,
+            f"optimizer_step_{optimizer_step:06d}_attempt_{self._k3_dump_sequence:06d}"
+            f"_rank_{global_rank:04d}_pid_{os.getpid()}.pt",
+        )
+        payload = {
+            "schema_version": 1,
+            "algorithm": "dspark",
+            "rl_step": int(rl_step),
+            "optimizer_step": optimizer_step,
+            "dump_sequence": int(self._k3_dump_sequence),
+            "global_rank": global_rank,
+            "rollout_dp_rank": int(self.rollout_dp_rank),
+            "writer_pid": os.getpid(),
+            "k3_log_ratio_clamp": float(
+                self._block_drafter_config_value("rejected_log_ratio_clamp", 20.0)
+            ),
+            "k3_loss_max_clamp": float(
+                self._block_drafter_config_value("rejected_loss_max_clamp", 10.0)
+            ),
+            "streams": cpu_streams,
+        }
+        try:
+            os.makedirs(step_dir, exist_ok=True)
+            self._atomic_torch_save(payload, output_path)
+        except (OSError, RuntimeError):
+            self._k3_dump_failures += 1
+            logger.exception("Failed to dump DSpark K3 logprobs to %s", output_path)
+            return
+        self._k3_dump_files += 1
+        self._k3_dump_tokens += total_tokens
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -1085,7 +1619,10 @@ class DrafterBaseTrainer:
     def _is_frozen_publish_param(self, name: str) -> bool:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
-        if any(frozen_name in name for frozen_name in self._frozen_param_names):
+        if any(
+            frozen_name in name
+            for frozen_name in getattr(self, "_frozen_param_names", ())
+        ):
             return True
         return name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
 
@@ -1171,7 +1708,8 @@ class DrafterBaseTrainer:
                     stripped_name = name[len(prefix) :]
                     break
             if stripped_name is not None:
-                stripped_state_dict[stripped_name] = tensor
+                if not self._is_frozen_publish_param(stripped_name):
+                    stripped_state_dict[stripped_name] = tensor
 
         return stripped_state_dict or full_state_dict
 
@@ -1182,7 +1720,7 @@ class DrafterBaseTrainer:
         # Save as HuggingFace-compatible PyTorch weights so SGLang and the
         # drafter trainer can load the checkpoint directory directly.
         save_kwargs: dict[str, Any] = {"safe_serialization": False}
-        spec_model_path = self.config.rollout.drafter.model_path
+        spec_model_path = self._drafter_export_source_path()
         if not spec_model_path or not os.path.isdir(spec_model_path):
             return save_kwargs
 
@@ -1211,8 +1749,14 @@ class DrafterBaseTrainer:
                 save_kwargs["max_shard_size"] = max(shard_sizes)
         return save_kwargs
 
+    def _drafter_export_source_path(self) -> Optional[str]:
+        drafter_config = self.config.rollout.drafter
+        return drafter_config.get(
+            "runtime_config_source_model_path"
+        ) or drafter_config.get("model_path")
+
     def _copy_drafter_auxiliary_files(self, output_dir: str) -> None:
-        spec_model_path = self.config.rollout.drafter.model_path
+        spec_model_path = self._drafter_export_source_path()
         if not spec_model_path or not os.path.isdir(spec_model_path):
             return
         for filename in ("generation_config.json",):
@@ -1227,6 +1771,16 @@ class DrafterBaseTrainer:
                         filename,
                         exc,
                     )
+
+    def _rewrite_exported_block_runtime_config(self, output_dir: str) -> None:
+        backend_type = getattr(self.backend, "model_type", None)
+        if backend_type not in {"dflash", "dspark"}:
+            return
+        rewrite_block_drafter_runtime_config(
+            backend_type,
+            self._drafter_export_source_path(),
+            output_dir,
+        )
 
     def _clear_existing_pretrained_weight_files(self, output_dir: str) -> None:
         for pattern in (
@@ -1434,7 +1988,7 @@ class DrafterBaseTrainer:
         self,
         checkpoint_path: str,
         step: int,
-        optimizer_manifest: dict[str, Any],
+        optimizer_manifest: dict[str, Any] | None,
     ):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
@@ -1502,6 +2056,7 @@ class DrafterBaseTrainer:
                     checkpoint_path, state_dict=model_state_dict, **save_kwargs
                 )
                 self._copy_drafter_auxiliary_files(checkpoint_path)
+                self._rewrite_exported_block_runtime_config(checkpoint_path)
                 self._atomic_json_dump(
                     {
                         "step": step,
@@ -1559,7 +2114,7 @@ class DrafterBaseTrainer:
     def _save_checkpoint_async(
         self,
         step: int,
-        optimizer_manifest: dict[str, Any],
+        optimizer_manifest: dict[str, Any] | None,
         is_final: bool = False,
     ):
         """Asynchronously save a directly loadable drafter checkpoint.
@@ -1585,6 +2140,7 @@ class DrafterBaseTrainer:
         self,
         step: int,
         wait: bool = True,
+        include_optimizer: bool = True,
     ) -> dict[str, Any]:
         if not self.checkpoint_dir:
             return {"saved": False, "reason": "missing_checkpoint_dir"}
@@ -1641,9 +2197,10 @@ class DrafterBaseTrainer:
         offload_elapsed = 0.0
         reclaim_elapsed = 0.0
         try:
-            optimizer_started = time.perf_counter()
-            optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
-            optimizer_elapsed = time.perf_counter() - optimizer_started
+            if include_optimizer:
+                optimizer_started = time.perf_counter()
+                optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
+                optimizer_elapsed = time.perf_counter() - optimizer_started
             if self._is_checkpoint_leader():
                 from verl_speco.trainer.checkpoint import (
                     format_checkpoint_memory_snapshot,
@@ -1702,13 +2259,17 @@ class DrafterBaseTrainer:
             )
 
         if future is None:
-            reason = "optimizer_shard_saved"
+            reason = (
+                "optimizer_shard_saved"
+                if include_optimizer
+                else "not_checkpoint_leader"
+            )
         elif wait:
             reason = "saved"
         else:
             reason = "scheduled"
         return {
-            "saved": optimizer_manifest is not None,
+            "saved": future is not None or optimizer_manifest is not None,
             "path": checkpoint_path,
             "reason": reason,
         }
@@ -1872,80 +2433,17 @@ class DrafterBaseTrainer:
             self._cached_target_lm_head_row_indices = row_info
         return row_info
 
-    def _target_lm_head_vocab_size(self) -> Optional[int]:
-        lm_head = self._target_lm_head_module()
-        if lm_head is not None and getattr(lm_head, "out_features", None) is not None:
-            return int(lm_head.out_features)
-        model_config = getattr(self, "model_config", None)
-        vocab_size = getattr(model_config, "vocab_size", None)
-        if vocab_size is not None:
-            return int(vocab_size)
-        try:
-            return int(self.config.actor_rollout_ref.model.get("vocab_size"))
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _dflash_target_lm_head_row_source_items(self) -> list[dict[str, Any]]:
-        current_step = int(self.current_rl_step)
-        if self.use_data_buffer and len(self.data_buffer) > 0:
-            sample_last_n = int(
-                self.config.rollout.drafter.training.get("sample_last_n_steps", 2)
-            )
-            items = self.data_buffer.get_data_from_last_n_steps(sample_last_n)
-            if items:
-                return items
-        return [
-            item
-            for item in self.collected_data
-            if int(item.get("step", current_step)) == current_step
-        ]
-
     def _build_target_lm_head_row_indices_from_dflash_data(
         self,
     ) -> Optional[dict[str, Any]]:
-        """Return a conservative DFlash restricted-CE row set from collected tokens.
+        """Block-drafter CE requires the complete target LM head.
 
-        DFlash restricted CE builds its vocab from the per-batch ``input_ids`` and
-        active targets.  The active targets are gathered from the same sample
-        windows, so syncing all valid token ids from candidate DFlash training
-        samples preserves the original loss semantics while avoiding a full
-        lm_head transfer.
+        ``restricted_ce`` now maps to exact chunked full-vocabulary CE. Sampled
+        CE also draws negatives during the forward pass, so its required rows
+        cannot be known at publish time. In both cases row-restricted target-head
+        synchronization would change the loss and is therefore disabled.
         """
-        loss_mode = str(self._block_drafter_config_value("loss_mode", "full_vocab"))
-        if loss_mode != "restricted_ce":
-            return None
-
-        source_vocab_size = self._target_lm_head_vocab_size()
-        if source_vocab_size is None or source_vocab_size <= 0:
-            return None
-
-        token_chunks = []
-        for item in self._dflash_target_lm_head_row_source_items():
-            input_ids = item.get("input_ids")
-            if not torch.is_tensor(input_ids):
-                continue
-            input_ids = cast(torch.Tensor, input_ids)
-            flat_ids = input_ids.detach().reshape(-1).to(dtype=torch.long, device="cpu")
-            valid = flat_ids[(flat_ids >= 0) & (flat_ids < int(source_vocab_size))]
-            if int(valid.numel()) > 0:
-                token_chunks.append(valid)
-        if not token_chunks:
-            return None
-
-        row_indices = (
-            torch.unique(torch.cat(token_chunks), sorted=True)
-            .to(dtype=torch.long)
-            .contiguous()
-        )
-        selected_rows = int(row_indices.numel())
-        if selected_rows <= 0 or selected_rows >= int(source_vocab_size):
-            return None
-        return {
-            "row_indices": row_indices,
-            "source_vocab_size": int(source_vocab_size),
-            "selected_rows": selected_rows,
-            "source": f"{self._block_drafter_metric_prefix()}_collected_tokens",
-        }
+        return None
 
     def _build_target_lm_head_row_indices_from_t2d(
         self, t2d: Optional[torch.Tensor]
@@ -2352,7 +2850,7 @@ class DrafterBaseTrainer:
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: torch.Tensor | None = None,
-    ) -> None:
+    ) -> int:
         """Collect online data from inference for drafter training.
 
         This method stores hidden states in the cross-step DataBuffer only when
@@ -2361,7 +2859,7 @@ class DrafterBaseTrainer:
         input_ids = batch.get("input_ids")
         if input_ids is None:
             logger.debug(f"[Rank {self.rank}] Non-batched data in input_ids")
-            return
+            return 0
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -2484,13 +2982,14 @@ class DrafterBaseTrainer:
         input_seq_length = cpu_input_ids.size(1)
         hidden_seq_length = cpu_h_states.size(1)
         if min(input_seq_length, hidden_seq_length) <= 0:
-            return
+            return 0
 
         model_config = getattr(self, "model_config", None)
         pad_id = int(
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
+        stored_count = 0
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
@@ -2921,8 +3420,24 @@ class DrafterBaseTrainer:
                 "hidden_raw_target_logprobs_positions": raw_target_logprobs_positions_item,
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
+                "hidden_window_stratum": batch.get("hidden_window_stratum"),
+                "speculative_trace": batch.get("speculative_trace"),
+                "speculative_trace_diagnostics": batch.get(
+                    "speculative_trace_diagnostics"
+                ),
+                "sample_id": batch.get("sample_id"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
             }
+
+            is_fixed_eval_holdout = (
+                self.fixed_eval_samples_per_replica > 0
+                and len(self.fixed_eval_data) < self.fixed_eval_samples_per_replica
+                and _has_mappable_verify_event(data_item)
+            )
+            if is_fixed_eval_holdout:
+                self.fixed_eval_data.append(data_item)
+                if self.fixed_eval_source_step is None:
+                    self.fixed_eval_source_step = self.current_rl_step
 
             if alignment_debug_enabled():
                 sample_index = self._alignment_debug_sample_index(
@@ -3069,6 +3584,12 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            # The persistent cohort is a real holdout: never feed its samples to
+            # the optimizer, including during the cycle that creates it.
+            if is_fixed_eval_holdout:
+                stored_count += 1
+                continue
+
             # 同步 DataBuffer
             if self.use_data_buffer:
                 self.data_buffer.add_batch(data_item)
@@ -3077,6 +3598,9 @@ class DrafterBaseTrainer:
             else:
                 data_item["step"] = self.current_rl_step
                 self.collected_data.append(data_item)
+            stored_count += 1
+
+        return stored_count
 
     def _get_hidden_state_clip_value(self) -> Optional[float]:
         clip_value = self.config.rollout.drafter.training.get(
@@ -3252,6 +3776,30 @@ class DrafterBaseTrainer:
         batch_size: int,
         rng: random.Random,
     ) -> list[dict[str, Any]]:
+        unique_first = bool(
+            self.config.rollout.drafter.training.get(
+                "train_unique_samples_first", False
+            )
+        )
+        if unique_first:
+            unseen = [
+                item
+                for item in available_data
+                if str(item.get("sample_id", f"object:{id(item)}"))
+                not in self._training_unique_sample_ids
+            ]
+            if len(unseen) >= batch_size:
+                available_data = unseen
+            elif unseen:
+                unseen_ids = {id(item) for item in unseen}
+                remaining = [
+                    item for item in available_data if id(item) not in unseen_ids
+                ]
+                selected = list(unseen)
+                selected.extend(
+                    rng.sample(remaining, min(batch_size - len(selected), len(remaining)))
+                )
+                return selected
         if len(available_data) <= batch_size:
             return list(available_data)
 
@@ -3286,6 +3834,9 @@ class DrafterBaseTrainer:
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
+        *,
+        items_override: Optional[list[dict[str, Any]]] = None,
+        track_sample_usage: bool = True,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
@@ -3311,7 +3862,9 @@ class DrafterBaseTrainer:
         # last-hidden supervision can only be reconstructed with the exact target
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
-        if self.use_data_buffer and len(self.data_buffer) > 0:
+        if items_override is not None:
+            items = list(items_override[:effective_batch_size])
+        elif self.use_data_buffer and len(self.data_buffer) > 0:
             if same_step_target_head_required:
                 buffer_steps = 0
             else:
@@ -3372,6 +3925,13 @@ class DrafterBaseTrainer:
             )
             return None
 
+        if track_sample_usage:
+            self._training_sample_draws += len(items)
+            for item in items:
+                sample_id = item.get("sample_id")
+                if sample_id not in (None, ""):
+                    self._training_unique_sample_ids.add(str(sample_id))
+
         dev = next(self.model.parameters()).device
         if self._is_block_drafter_backend() and self.use_ulysses_sp:
             raise NotImplementedError(
@@ -3395,22 +3955,55 @@ class DrafterBaseTrainer:
         loss_mask_chunks = []
         hidden_state_chunks = []
         position_id_chunks = []
+        global_context_mask_chunks = []
         last_hidden_state_chunks = []
         target_logprob_chunks = []
         target_last_hidden_state_chunks = []
+        trace_anchor_position_chunks = []
+        trace_accepted_count_chunks = []
+        trace_draft_count_chunks = []
+        trace_rejected_token_chunks = []
+        trace_draft_token_id_chunks = []
+        trace_draft_teacher_logprob_chunks = []
+        trace_draft_teacher_logprob_mask_chunks = []
+        trace_bonus_response_anchor_mask_chunks = []
+        trace_topk_chunks = {
+            key: []
+            for key in ("trace_draft_topk_ids", "trace_draft_topk_teacher_logprobs")
+            if key in preprocessed_lists
+        }
+        trace_topk_batch = {}
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
+        global_context_mask_list = preprocessed_lists.get("global_context_masks")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_l1_enabled = (
+        dspark_target_distribution_enabled = (
             self.backend.model_type == "dspark"
-            and float(
-                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
-                or 0.0
+            and dspark_target_distribution_loss_enabled(
+                self.config.rollout.drafter.training
             )
-            > 0
+        )
+        dspark_trace_aligned = self.backend.model_type == "dspark" and bool(
+            self.config.rollout.drafter.training.get(
+                "dspark_trace_aligned_anchors", False
+            )
+        )
+        trace_anchor_list = preprocessed_lists.get("trace_anchor_positions")
+        trace_accepted_list = preprocessed_lists.get("trace_accepted_counts")
+        trace_draft_list = preprocessed_lists.get("trace_draft_counts")
+        trace_rejected_list = preprocessed_lists.get("trace_rejected_token_ids")
+        trace_draft_token_id_list = preprocessed_lists.get("trace_draft_token_ids")
+        trace_draft_teacher_logprob_list = preprocessed_lists.get(
+            "trace_draft_teacher_logprobs"
+        )
+        trace_draft_teacher_logprob_mask_list = preprocessed_lists.get(
+            "trace_draft_teacher_logprob_mask"
+        )
+        trace_bonus_response_anchor_mask_list = preprocessed_lists.get(
+            "trace_bonus_response_anchor_mask"
         )
         if position_list is None:
             position_list = [
@@ -3440,9 +4033,32 @@ class DrafterBaseTrainer:
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_l1_enabled and not torch.is_tensor(target_last_h_states):
+            if dspark_target_distribution_enabled and not torch.is_tensor(
+                target_last_h_states
+            ):
                 items_dropped_missing_target += 1
                 continue
+            if dspark_trace_aligned:
+                trace_metadata_lists = (
+                    trace_anchor_list,
+                    trace_accepted_list,
+                    trace_draft_list,
+                    trace_rejected_list,
+                    trace_draft_token_id_list,
+                    trace_draft_teacher_logprob_list,
+                    trace_draft_teacher_logprob_mask_list,
+                    trace_bonus_response_anchor_mask_list,
+                )
+                if any(
+                    values is None or item_idx >= len(values)
+                    for values in trace_metadata_lists
+                ):
+                    items_dropped_missing_target += 1
+                    continue
+                item_trace_anchors = trace_anchor_list[item_idx]
+                if not torch.is_tensor(item_trace_anchors) or item_trace_anchors.numel() <= 0:
+                    items_dropped_missing_target += 1
+                    continue
 
             target_logprobs_item: Any = None
             target_logprobs_train_start = 0
@@ -3776,6 +4392,10 @@ class DrafterBaseTrainer:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
                 loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            if global_context_mask_list is not None:
+                global_context_mask_chunks.append(
+                    global_context_mask_list[item_idx][:train_seq_len]
+                )
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
@@ -3793,14 +4413,44 @@ class DrafterBaseTrainer:
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+            elif dspark_target_distribution_enabled and torch.is_tensor(
+                target_last_h_states
+            ):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]
                 )
+            if dspark_trace_aligned:
+                trace_anchor_position_chunks.append(trace_anchor_list[item_idx])
+                trace_accepted_count_chunks.append(trace_accepted_list[item_idx])
+                trace_draft_count_chunks.append(trace_draft_list[item_idx])
+                trace_rejected_token_chunks.append(trace_rejected_list[item_idx])
+                trace_draft_token_id_chunks.append(
+                    trace_draft_token_id_list[item_idx]
+                )
+                trace_draft_teacher_logprob_chunks.append(
+                    trace_draft_teacher_logprob_list[item_idx]
+                )
+                trace_draft_teacher_logprob_mask_chunks.append(
+                    trace_draft_teacher_logprob_mask_list[item_idx]
+                )
+                trace_bonus_response_anchor_mask_chunks.append(
+                    trace_bonus_response_anchor_mask_list[item_idx]
+                )
+                for key, chunks in trace_topk_chunks.items():
+                    chunks.append(preprocessed_lists[key][item_idx])
 
         if not input_id_chunks:
             return None
+
+        for key, chunks in trace_topk_chunks.items():
+            if len(chunks) != len(input_id_chunks):
+                raise ValueError("DSpark topk metadata must cover every training sample")
+            trace_topk_batch[key] = torch.nn.utils.rnn.pad_sequence(
+                chunks,
+                batch_first=True,
+                padding_value=-1 if key.endswith("_ids") else 0.0,
+            )
 
         if self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
@@ -3831,6 +4481,11 @@ class DrafterBaseTrainer:
                 device=dev,
             )
             attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
+            global_context_mask = (
+                torch.zeros_like(input_ids, dtype=torch.bool, device=dev)
+                if global_context_mask_chunks
+                else None
+            )
             for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
                 zip(
                     input_id_chunks,
@@ -3845,6 +4500,10 @@ class DrafterBaseTrainer:
                 base_h[row_idx, :row_len] = h_chunk
                 position_ids[row_idx, :row_len] = pos_chunk
                 attn_mask[row_idx, :row_len] = 1
+                if global_context_mask is not None:
+                    global_context_mask[row_idx, :row_len] = global_context_mask_chunks[
+                        row_idx
+                    ]
             target_last_hidden_states = None
             if target_last_hidden_state_chunks:
                 if len(target_last_hidden_state_chunks) != len(input_id_chunks):
@@ -3868,6 +4527,104 @@ class DrafterBaseTrainer:
                 ):
                     target_last_hidden_states[row_idx, : target_h_chunk.size(0)] = (
                         target_h_chunk
+                    )
+            trace_anchor_positions = None
+            trace_anchor_mask = None
+            trace_accepted_counts = None
+            trace_draft_counts = None
+            trace_rejected_token_ids = None
+            trace_draft_token_ids = None
+            trace_draft_teacher_logprobs = None
+            trace_draft_teacher_logprob_mask = None
+            trace_bonus_response_anchor_mask = None
+            if dspark_trace_aligned:
+                if len(trace_anchor_position_chunks) != len(input_id_chunks):
+                    logger.warning(
+                        "[dspark-trainer] dropping batch with partial trace anchor metadata: "
+                        "trace_rows=%s batch_rows=%s",
+                        len(trace_anchor_position_chunks),
+                        len(input_id_chunks),
+                    )
+                    return None
+                max_trace_anchors = max(
+                    int(chunk.numel()) for chunk in trace_anchor_position_chunks
+                )
+                trace_anchor_positions = torch.zeros(
+                    len(trace_anchor_position_chunks),
+                    max_trace_anchors,
+                    dtype=torch.long,
+                    device=dev,
+                )
+                trace_anchor_mask = torch.zeros_like(
+                    trace_anchor_positions, dtype=torch.bool
+                )
+                trace_accepted_counts = torch.zeros_like(trace_anchor_positions)
+                trace_draft_counts = torch.zeros_like(trace_anchor_positions)
+                trace_rejected_token_ids = torch.full_like(
+                    trace_anchor_positions, -1
+                )
+                trace_block_size = int(trace_draft_token_id_chunks[0].size(-1))
+                trace_draft_token_ids = torch.full(
+                    (
+                        len(trace_anchor_position_chunks),
+                        max_trace_anchors,
+                        trace_block_size,
+                    ),
+                    -1,
+                    dtype=torch.long,
+                    device=dev,
+                )
+                trace_draft_teacher_logprobs = torch.zeros(
+                    (
+                        len(trace_anchor_position_chunks),
+                        max_trace_anchors,
+                        trace_block_size,
+                    ),
+                    dtype=torch.float32,
+                    device=dev,
+                )
+                trace_draft_teacher_logprob_mask = torch.zeros_like(
+                    trace_draft_teacher_logprobs, dtype=torch.bool
+                )
+                trace_bonus_response_anchor_mask = torch.zeros_like(
+                    trace_anchor_positions, dtype=torch.bool
+                )
+                for row_idx, (
+                    anchor_chunk,
+                    accepted_chunk,
+                    draft_chunk,
+                    rejected_chunk,
+                    draft_token_chunk,
+                    teacher_logprob_chunk,
+                    teacher_logprob_mask_chunk,
+                    bonus_response_anchor_mask_chunk,
+                ) in enumerate(
+                    zip(
+                        trace_anchor_position_chunks,
+                        trace_accepted_count_chunks,
+                        trace_draft_count_chunks,
+                        trace_rejected_token_chunks,
+                        trace_draft_token_id_chunks,
+                        trace_draft_teacher_logprob_chunks,
+                        trace_draft_teacher_logprob_mask_chunks,
+                        trace_bonus_response_anchor_mask_chunks,
+                    )
+                ):
+                    width = int(anchor_chunk.numel())
+                    trace_anchor_positions[row_idx, :width] = anchor_chunk
+                    trace_anchor_mask[row_idx, :width] = True
+                    trace_accepted_counts[row_idx, :width] = accepted_chunk
+                    trace_draft_counts[row_idx, :width] = draft_chunk
+                    trace_rejected_token_ids[row_idx, :width] = rejected_chunk
+                    trace_draft_token_ids[row_idx, :width] = draft_token_chunk
+                    trace_draft_teacher_logprobs[row_idx, :width] = (
+                        teacher_logprob_chunk
+                    )
+                    trace_draft_teacher_logprob_mask[row_idx, :width] = (
+                        teacher_logprob_mask_chunk
+                    )
+                    trace_bonus_response_anchor_mask[row_idx, :width] = (
+                        bonus_response_anchor_mask_chunk
                     )
         else:
             input_ids = torch.cat(input_id_chunks, dim=0).unsqueeze(0).contiguous()
@@ -3905,6 +4662,8 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if self.backend.model_type == "dspark" and global_context_mask is not None:
+            batch["global_context_mask"] = global_context_mask
         if self.backend.model_type == "eagle3":
             if use_logits:
                 batch["target_logprobs"] = target_logprobs
@@ -3923,8 +4682,23 @@ class DrafterBaseTrainer:
             )
         elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if dspark_trace_aligned:
+            batch.update(
+                {
+                    "trace_anchor_positions": trace_anchor_positions,
+                    "trace_anchor_mask": trace_anchor_mask,
+                    "trace_accepted_counts": trace_accepted_counts,
+                    "trace_draft_counts": trace_draft_counts,
+                    "trace_rejected_token_ids": trace_rejected_token_ids,
+                    "trace_draft_token_ids": trace_draft_token_ids,
+                    "trace_draft_teacher_logprobs": trace_draft_teacher_logprobs,
+                    "trace_draft_teacher_logprob_mask": trace_draft_teacher_logprob_mask,
+                    "trace_bonus_response_anchor_mask": trace_bonus_response_anchor_mask,
+                }
+            )
 
         batch = self._sanitize_training_batch(batch)
+        batch.update(trace_topk_batch)
         input_ids = batch["input_ids"]
         attn_mask = batch["attention_mask"]
         base_h = batch["hidden_states"]
@@ -3946,6 +4720,20 @@ class DrafterBaseTrainer:
             self.backend.model_type == "dspark" and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
+        if dspark_trace_aligned:
+            trace_anchor_positions = batch["trace_anchor_positions"]
+            trace_anchor_mask = batch["trace_anchor_mask"]
+            trace_accepted_counts = batch["trace_accepted_counts"]
+            trace_draft_counts = batch["trace_draft_counts"]
+            trace_rejected_token_ids = batch["trace_rejected_token_ids"]
+            trace_draft_token_ids = batch["trace_draft_token_ids"]
+            trace_draft_teacher_logprobs = batch["trace_draft_teacher_logprobs"]
+            trace_draft_teacher_logprob_mask = batch[
+                "trace_draft_teacher_logprob_mask"
+            ]
+            trace_bonus_response_anchor_mask = batch[
+                "trace_bonus_response_anchor_mask"
+            ]
 
         # Use Ulysses SP to pad and slice if needed.
         pad_size_for_batch = 0
@@ -4036,7 +4824,22 @@ class DrafterBaseTrainer:
             batch["seq_lengths"] = peagle_seq_lengths
         elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if dspark_trace_aligned:
+            batch.update(
+                {
+                    "trace_anchor_positions": trace_anchor_positions,
+                    "trace_anchor_mask": trace_anchor_mask,
+                    "trace_accepted_counts": trace_accepted_counts,
+                    "trace_draft_counts": trace_draft_counts,
+                    "trace_rejected_token_ids": trace_rejected_token_ids,
+                    "trace_draft_token_ids": trace_draft_token_ids,
+                    "trace_draft_teacher_logprobs": trace_draft_teacher_logprobs,
+                    "trace_draft_teacher_logprob_mask": trace_draft_teacher_logprob_mask,
+                    "trace_bonus_response_anchor_mask": trace_bonus_response_anchor_mask,
+                }
+            )
         batch["_speco_pad_size"] = pad_size_for_batch
+        batch.update(trace_topk_batch)
 
         if alignment_debug_enabled():
             final_target = None
@@ -4153,17 +4956,34 @@ class DrafterBaseTrainer:
         return batch
 
     def _sync_batch_readiness(self, has_local_batch: bool) -> bool:
-        dp_group = self._get_dp_group()
-        if dp_group is None or self._get_dp_world_size() <= 1:
-            return has_local_batch
-
         readiness = torch.tensor(
             [1 if has_local_batch else 0],
             device=self.runtime_device,
             dtype=torch.int32,
         )
-        dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
-        return bool(readiness.item())
+        # FSDP's parameter collectives run over SP, and the loss/metric
+        # reductions subsequently run over DP.  A DP-only readiness check lets
+        # one rank in an SP group return early while its peers enter FSDP, which
+        # eventually becomes an HCCL timeout.  All ranks execute the same two
+        # reductions here; MIN makes the entire training mesh skip together.
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=sp_group)
+        if dp_group is not None and self._get_dp_world_size() > 1:
+            dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
+        globally_ready = bool(readiness.item())
+        if has_local_batch and not globally_ready:
+            logger.warning(
+                "[DrafterTrainer rank %s] skipping drafter microstep because at "
+                "least one SP/DP peer has no trainable batch",
+                self.rank,
+            )
+        if not globally_ready:
+            self._training_mesh_batch_skips = int(
+                getattr(self, "_training_mesh_batch_skips", 0) or 0
+            ) + 1
+        return globally_ready
 
     def prepare_training_batch(self) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
@@ -4276,7 +5096,22 @@ class DrafterBaseTrainer:
             return False
 
         prepare_ts = time.time()
-        batch = self.prepare_training_batch()
+        batch: Optional[dict[str, torch.Tensor]] = None
+        try:
+            batch = self.prepare_training_batch()
+        except Exception:  # noqa: BLE001
+            # Do not let one rank return before its SP peers reach FSDP.  The
+            # readiness collective below turns a recoverable local preparation
+            # error into a mesh-wide skipped microstep instead of a later HCCL
+            # timeout in forward/backward.
+            logger.exception(
+                "[DrafterTrainer rank %s] failed to prepare drafter batch at step %s",
+                self.rank,
+                step,
+            )
+            self._training_batch_prepare_failures = int(
+                getattr(self, "_training_batch_prepare_failures", 0) or 0
+            ) + 1
         self.record_training_timing(
             "timing_s/drafter_prepare_batch", time.time() - prepare_ts
         )
@@ -4293,6 +5128,223 @@ class DrafterBaseTrainer:
             return False
 
         return await self._training_step_on_batch(batch, step)
+
+    def evaluate_fixed_cohort(self) -> dict[str, float]:
+        """Evaluate the persistent per-rank cohort without changing optimizer state."""
+
+        if self.fixed_eval_samples_per_replica <= 0:
+            return {}
+        batch = None
+        try:
+            batch = self._prepare_training_batch(
+                items_override=self.fixed_eval_data,
+                track_sample_usage=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[DrafterTrainer rank %s] failed to prepare fixed cohort", self.rank
+            )
+        if not self._sync_batch_readiness(batch is not None):
+            return {}
+        if batch is None:
+            return {}
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                with self._ulysses_group_context():
+                    with torch.amp.autocast(
+                        device_type=device_name, dtype=torch.bfloat16
+                    ):
+                        pad_size = int(
+                            batch.get("_speco_pad_size", self._current_pad_size) or 0
+                        )
+                        loss_batch = {
+                            key: value
+                            for key, value in batch.items()
+                            if not key.startswith("_speco_")
+                        }
+                        loss_dict = self.backend.compute_loss(
+                            self.model, loss_batch, pad_size
+                        )
+        finally:
+            self.model.train(was_training)
+
+        diagnostics = loss_dict.get("diagnostics") or {}
+        metric_keys = (
+            "fixed_loss_sum",
+            "fixed_token_count",
+            "auxiliary_loss_sum",
+            "auxiliary_token_count",
+            "first_rejection_ce_loss_sum",
+            "first_rejection_ce_token_count",
+            "first_rejection_ce_q_prob_sum",
+            "ce_loss_sum",
+            "ce_weighted_token_count",
+            "l1_loss_sum",
+            "l1_weighted_token_count",
+            "accepted_fkl_sum",
+            "accepted_fkl_weighted_count",
+            "accepted_k3_sum",
+            "accepted_k3_weighted_count",
+            "accepted_k3_clamped_count",
+            "accepted_q_prob_sum",
+            "accepted_p_prob_sum",
+            "accepted_log_ratio_sum",
+            "rejected_k3_sum",
+            "rejected_k3_weighted_count",
+            "rejected_q_prob_sum",
+            "rejected_p_prob_sum",
+            "rejected_teacher_minus_draft_log_ratio_sum",
+            "rejected_k3_clamped_count",
+            "top1_correct_count",
+            "quality_token_count",
+            "trace_anchor_count",
+            "trace_accepted_position_count",
+            "trace_first_rejection_count",
+            "trace_unverified_suffix_count",
+            "trace_all_accepted_anchor_count",
+            "trace_bonus_response_position_count",
+        )
+        metric_device = batch["input_ids"].device
+        fixed_loss_sum = (
+            loss_dict["v_weight"] * loss_dict["total_local_vloss"]
+            + loss_dict["p_weight"] * loss_dict["total_local_ploss"]
+        )
+        fixed_token_count = loss_dict["local_num_tokens"]
+        direct_metrics = {
+            "fixed_loss_sum": fixed_loss_sum,
+            "fixed_token_count": fixed_token_count,
+        }
+        auxiliary = loss_dict.get("auxiliary_loss")
+        if auxiliary is not None:
+            direct_metrics["auxiliary_loss_sum"] = auxiliary["loss_sum"]
+            direct_metrics["auxiliary_token_count"] = auxiliary["token_count"]
+        metric_sources = {**diagnostics, **direct_metrics}
+        packed = torch.stack(
+            [
+                (
+                    metric_sources[key].detach().float().reshape(())
+                    if torch.is_tensor(metric_sources.get(key))
+                    else torch.zeros((), device=metric_device, dtype=torch.float32)
+                )
+                for key in metric_keys
+            ]
+        )
+        reduced = self._reduce_training_metric(packed).detach().cpu().tolist()
+        values = dict(zip(metric_keys, (float(value) for value in reduced)))
+
+        ce_den = values["ce_weighted_token_count"]
+        l1_den = values["l1_weighted_token_count"]
+        accepted_fkl_den = values["accepted_fkl_weighted_count"]
+        accepted_k3_den = values["accepted_k3_weighted_count"]
+        rejection_den = values["rejected_k3_weighted_count"]
+        ce_loss = values["ce_loss_sum"] / ce_den if ce_den > 0 else 0.0
+        l1_loss = values["l1_loss_sum"] / l1_den if l1_den > 0 else 0.0
+        accepted_fkl = (
+            values["accepted_fkl_sum"] / accepted_fkl_den
+            if accepted_fkl_den > 0
+            else 0.0
+        )
+        accepted_k3 = (
+            values["accepted_k3_sum"] / accepted_k3_den
+            if accepted_k3_den > 0
+            else 0.0
+        )
+        rejected_k3 = (
+            values["rejected_k3_sum"] / rejection_den
+            if rejection_den > 0
+            else 0.0
+        )
+        total_loss = (
+            values["fixed_loss_sum"] / values["fixed_token_count"]
+            if values["fixed_token_count"] > 0
+            else 0.0
+        )
+        auxiliary_contribution = (
+            values["auxiliary_loss_sum"] / values["auxiliary_token_count"]
+            if values["auxiliary_token_count"] > 0 else 0.0
+        )
+        total_loss += auxiliary_contribution
+        sample_count = torch.tensor(
+            float(batch["input_ids"].size(0)),
+            device=metric_device,
+            dtype=torch.float32,
+        )
+        global_sample_count = float(
+            self._reduce_training_metric(sample_count).detach().cpu().item()
+        )
+        result = {
+            "loss": total_loss,
+            "first_rejection_ce_loss": (
+                values["first_rejection_ce_loss_sum"] / values["first_rejection_ce_token_count"]
+                if values["first_rejection_ce_token_count"] > 0 else 0.0
+            ),
+            "first_rejection_ce_q_prob": (
+                values["first_rejection_ce_q_prob_sum"] / values["first_rejection_ce_token_count"]
+                if values["first_rejection_ce_token_count"] > 0 else 0.0
+            ),
+            "first_rejection_ce_contribution": auxiliary_contribution,
+            "ce_loss": ce_loss,
+            "l1_loss": l1_loss,
+            "accepted_fkl": accepted_fkl,
+            "accepted_k3": accepted_k3,
+            "accepted_k3_clamp_ratio": (
+                values["accepted_k3_clamped_count"] / accepted_k3_den
+                if accepted_k3_den > 0
+                else 0.0
+            ),
+            "accepted_q_prob": (
+                values["accepted_q_prob_sum"] / accepted_fkl_den
+                if accepted_fkl_den > 0
+                else 0.0
+            ),
+            "accepted_p_prob": (
+                values["accepted_p_prob_sum"] / accepted_fkl_den
+                if accepted_fkl_den > 0
+                else 0.0
+            ),
+            "rejected_k3": rejected_k3,
+            "rejected_q_prob": (
+                values["rejected_q_prob_sum"] / rejection_den
+                if rejection_den > 0
+                else 0.0
+            ),
+            "rejected_p_prob": (
+                values["rejected_p_prob_sum"] / rejection_den
+                if rejection_den > 0
+                else 0.0
+            ),
+            "rejected_teacher_minus_draft_log_ratio": (
+                values["rejected_teacher_minus_draft_log_ratio_sum"]
+                / rejection_den
+                if rejection_den > 0
+                else 0.0
+            ),
+            "rejected_k3_clamp_ratio": (
+                values["rejected_k3_clamped_count"] / rejection_den
+                if rejection_den > 0
+                else 0.0
+            ),
+            "top1_acc": (
+                values["top1_correct_count"] / values["quality_token_count"]
+                if values["quality_token_count"] > 0
+                else 0.0
+            ),
+            "samples": global_sample_count,
+            "source_step": float(self.fixed_eval_source_step or 0),
+        }
+        for key in (
+            "trace_anchor_count",
+            "trace_accepted_position_count",
+            "trace_first_rejection_count",
+            "trace_unverified_suffix_count",
+            "trace_all_accepted_anchor_count",
+            "trace_bonus_response_position_count",
+        ):
+            result[key] = values[key]
+        return result
 
     def _reduce_loss_metrics(
         self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor
@@ -4325,6 +5377,30 @@ class DrafterBaseTrainer:
             reduce_world_size *= self.training_device_mesh.size()
         return metrics[0], metrics[1], metrics[2], reduce_world_size
 
+    def _reduce_auxiliary_loss(
+        self, loss_dict: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalize an optional auxiliary sum on its own global token count.
+
+        Return its detached metric, differentiable local contribution (including
+        FSDP mean compensation), and global count. Disabled objectives perform
+        no extra collective. All enabled ranks participate, including ranks
+        with zero local auxiliary tokens.
+        """
+        zero = loss_dict["total_local_ploss"].new_zeros(())
+        auxiliary = loss_dict.get("auxiliary_loss")
+        if auxiliary is None:
+            return zero, zero, zero
+        _, global_sum, global_count, world_size = self._reduce_loss_metrics(
+            zero, auxiliary["loss_sum"], auxiliary["token_count"]
+        )
+        denominator = global_count.clamp(min=1.0)
+        return (
+            global_sum / denominator,
+            auxiliary["loss_sum"] * (float(world_size) / denominator),
+            global_count,
+        )
+
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
@@ -4353,16 +5429,19 @@ class DrafterBaseTrainer:
             "timing_s/drafter_forward_loss", time.time() - forward_ts
         )
 
-        # Reduce scalar loss statistics once across SP/DP groups.
+        # Reduce the base objective and, if enabled, the independent auxiliary mean.
         reduce_ts = time.time()
         global_vloss, global_ploss, global_tokens, reduce_world_size = (
             self._reduce_loss_metrics(l_v, l_p, l_n)
+        )
+        auxiliary_loss, local_auxiliary_loss, auxiliary_tokens = (
+            self._reduce_auxiliary_loss(loss_dict)
         )
         self.record_training_timing(
             "timing_s/drafter_reduce_loss", time.time() - reduce_ts
         )
 
-        if float(global_tokens.detach().float().item()) <= 0:
+        if float((global_tokens + auxiliary_tokens).detach().float().item()) <= 0:
             logger.debug(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
             )
@@ -4373,7 +5452,9 @@ class DrafterBaseTrainer:
         ploss = global_ploss / denom
 
         # Global token-mean loss, identical on every rank; used for guards and logging.
-        loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
+        loss = (
+            loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss + auxiliary_loss
+        )
         if not torch.isfinite(loss):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter loss, "
@@ -4392,7 +5473,7 @@ class DrafterBaseTrainer:
         # gradient regardless of world size.
         local_loss = (loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p) * (
             float(reduce_world_size) / denom
-        )
+        ) + local_auxiliary_loss
         backward_ts = time.time()
         local_loss.backward()
         self.record_training_timing(
@@ -4411,12 +5492,31 @@ class DrafterBaseTrainer:
             )
             self.optimizer.zero_grad(set_to_none=True)
             return False
+        scalar_values = {
+            "drafter/train_loss_sum": loss,
+            "drafter/train_vloss_sum": vloss,
+            "drafter/train_ploss_sum": ploss,
+            "drafter/train_grad_norm_sum": grad_norm,
+            "drafter/train_token_count": global_tokens,
+        }
+        for key, value in scalar_values.items():
+            self._training_metric_sums[key] = self._training_metric_sums.get(
+                key, 0.0
+            ) + float(value.detach().float().cpu().item())
+        self._training_metric_sums["drafter/train_scalar_steps"] = (
+            self._training_metric_sums.get("drafter/train_scalar_steps", 0.0) + 1.0
+        )
         current_lr = float(self.optimizer.param_groups[0]["lr"])
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer_steps_total += 1
         self.optimizer.zero_grad(set_to_none=True)
+        self._maybe_dump_dspark_k3_logprobs(
+            loss_dict,
+            step,
+            optimizer_step=self.optimizer_steps_total,
+        )
         self.record_training_timing(
             "timing_s/drafter_optimizer", time.time() - optimizer_ts
         )
@@ -4499,9 +5599,9 @@ class DrafterBaseTrainer:
 
             result = {
                 k: (
-                    v.detach().to(dtype=dtype, device="cpu").contiguous()
+                    v.detach().to(dtype=dtype, device="cpu").contiguous().clone()
                     if dtype is not None
-                    else v.detach().cpu().contiguous()
+                    else v.detach().cpu().contiguous().clone()
                 )
                 for k, v in trainable_state.items()
             }
@@ -4515,6 +5615,152 @@ class DrafterBaseTrainer:
         self._pending_publish_state_dict = None
         self._pending_publish_step = None
         self._pending_publish_ready = False
+
+    @staticmethod
+    def _candidate_local_tensor(parameter: torch.Tensor) -> torch.Tensor:
+        """Return the local storage tensor for ordinary, FSDP1, or DTensor params."""
+        to_local = getattr(parameter, "to_local", None)
+        return to_local() if callable(to_local) else parameter
+
+    def clear_candidate_update(self) -> None:
+        self._candidate_baseline_state_dict = None
+        self._candidate_trained_state_dict = None
+        self._candidate_local_baseline = None
+        self._candidate_step = None
+        self._candidate_training_steps = None
+        self._candidate_optimizer_steps_total = None
+        self._candidate_scheduler_state = None
+        self._candidate_optimizer_lrs = None
+
+    def begin_candidate_update(self, global_step: Optional[int]) -> bool:
+        """Snapshot the serving state and local trainable shards before training."""
+        self.clear_candidate_update()
+        step = int(global_step) if global_step is not None else None
+        self._candidate_baseline_state_dict = self.get_model_state_dict()
+        self._candidate_local_baseline = {
+            name: self._candidate_local_tensor(parameter)
+            .detach()
+            .to(device="cpu")
+            .clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        self._candidate_step = step
+        self._candidate_training_steps = int(self.training_steps)
+        self._candidate_optimizer_steps_total = int(self.optimizer_steps_total)
+        if self.lr_scheduler is not None:
+            self._candidate_scheduler_state = self.lr_scheduler.state_dict()
+        if self.optimizer is not None:
+            self._candidate_optimizer_lrs = [
+                float(group.get("lr", 0.0)) for group in self.optimizer.param_groups
+            ]
+        return bool(self._candidate_baseline_state_dict) or self.rank != 0
+
+    def prepare_candidate_update(self, global_step: Optional[int]) -> bool:
+        """Snapshot the post-training publish payload without discarding baseline."""
+        step = int(global_step) if global_step is not None else None
+        if self._candidate_step != step:
+            self.clear_candidate_update()
+            return False
+        self._candidate_trained_state_dict = self.get_model_state_dict()
+        return bool(self._candidate_trained_state_dict) or self.rank != 0
+
+    def get_candidate_state_dict(
+        self, global_step: Optional[int], alpha: float
+    ) -> tuple[bool, Optional[dict[str, torch.Tensor]]]:
+        """Return theta=(1-alpha)*baseline+alpha*trained for hot publication."""
+        step = int(global_step) if global_step is not None else None
+        if self._candidate_step != step:
+            return False, None
+        try:
+            alpha = float(alpha)
+        except (TypeError, ValueError):
+            return False, None
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            return False, None
+        baseline = self._candidate_baseline_state_dict
+        trained = self._candidate_trained_state_dict
+        if not baseline or not trained:
+            return False, None
+        if alpha == 0.0:
+            return True, baseline
+        if alpha == 1.0:
+            return True, trained
+        if baseline.keys() != trained.keys():
+            logger.error("Candidate drafter state keys changed during step %s", step)
+            return False, None
+        mixed = {
+            name: torch.lerp(baseline[name], trained[name], alpha).contiguous()
+            for name in baseline
+        }
+        return True, mixed
+
+    def finalize_candidate_update(
+        self, global_step: Optional[int], alpha: float
+    ) -> bool:
+        """Commit the selected interpolation locally, or restore the baseline."""
+        step = int(global_step) if global_step is not None else None
+        if self._candidate_step != step or self._candidate_local_baseline is None:
+            return False
+        alpha = float(alpha)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"candidate alpha must be in [0, 1], got {alpha}")
+
+        if alpha < 1.0:
+            first_param = next(self.model.parameters(), None)
+            was_on_device = (
+                first_param is not None and first_param.device.type == device_name
+            )
+            is_fsdp_wrapped = (
+                isinstance(self.model, FSDP) or self.training_device_mesh is not None
+            )
+            if is_fsdp_wrapped and not was_on_device:
+                load_fsdp_model_to_gpu(self.model)
+            try:
+                with torch.no_grad():
+                    for name, parameter in self.model.named_parameters():
+                        baseline = self._candidate_local_baseline.get(name)
+                        if baseline is None:
+                            continue
+                        local = self._candidate_local_tensor(parameter)
+                        baseline = baseline.to(
+                            device=local.device, dtype=local.dtype, non_blocking=True
+                        )
+                        if alpha == 0.0:
+                            local.copy_(baseline)
+                        else:
+                            local.lerp_(baseline, 1.0 - alpha)
+                # Adam moments correspond only to the full candidate. Reset them
+                # after rollback/partial interpolation instead of carrying stale
+                # momentum into the next update.
+                if self.optimizer is not None:
+                    self.optimizer.state.clear()
+                    if alpha == 0.0:
+                        for group, lr in zip(
+                            self.optimizer.param_groups,
+                            self._candidate_optimizer_lrs or (),
+                        ):
+                            group["lr"] = lr
+                if alpha == 0.0:
+                    if (
+                        self._candidate_scheduler_state is not None
+                        and self.lr_scheduler is not None
+                    ):
+                        self.lr_scheduler.load_state_dict(
+                            self._candidate_scheduler_state
+                        )
+                    if self._candidate_training_steps is not None:
+                        self.training_steps = self._candidate_training_steps
+                    if self._candidate_optimizer_steps_total is not None:
+                        self.optimizer_steps_total = (
+                            self._candidate_optimizer_steps_total
+                        )
+            finally:
+                if is_fsdp_wrapped and not was_on_device:
+                    offload_fsdp_model_to_cpu(self.model)
+        self.clear_candidate_update()
+        self.clear_pending_publish_state_dict()
+        return True
 
     def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
         """Snapshot trainable drafter weights before cleanup/offload for fast publish."""

@@ -27,6 +27,7 @@ from verl_speco.trainer.checkpoint import (
     is_pretrained_drafter_checkpoint,
     release_checkpoint_host_memory,
     resolve_drafter_checkpoint_path,
+    rewrite_block_drafter_runtime_config,
     trim_process_host_memory,
 )
 
@@ -107,6 +108,21 @@ def test_managed_checkpoint_without_metadata_is_incomplete(tmp_path) -> None:
     assert not is_pretrained_drafter_checkpoint(checkpoint)
 
 
+def test_empty_pytorch_state_dict_is_not_a_complete_drafter_checkpoint(
+    tmp_path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    checkpoint = tmp_path / "draft_step_20"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    torch.save({}, checkpoint / "pytorch_model.bin")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 20, "complete": True}), encoding="utf-8"
+    )
+
+    assert not is_pretrained_drafter_checkpoint(checkpoint)
+
+
 def test_optimizer_manifest_requires_complete_dcp_state(tmp_path) -> None:
     checkpoint = tmp_path / "draft_step_20"
     optimizer = checkpoint / "optimizer"
@@ -148,6 +164,67 @@ def test_resolve_rejects_checkpoint_with_mismatched_metadata_step(tmp_path) -> N
     assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(
         original_model
     )
+
+
+def test_rewrite_dflash_checkpoint_uses_runtime_model_config(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["DFlashDraftModel"],
+                "dflash_config": {"target_layer_ids": [1, 9, 17]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "draft_step_20"
+    checkpoint.mkdir()
+    training_config = {
+        "model_type": "dflash",
+        "architectures": ["DFlashDraftModel"],
+        "target_layer_ids": [1, 9, 17],
+        "mask_token_id": 151669,
+        "num_context_layers": 3,
+    }
+    (checkpoint / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
+
+    assert rewrite_block_drafter_runtime_config("dflash", source, checkpoint)
+    runtime_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    saved_training_config = json.loads(
+        (checkpoint / "speco_training_config.json").read_text(encoding="utf-8")
+    )
+
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["speco_training_model_type"] == "dflash"
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
+    assert saved_training_config == training_config
+
+    from transformers import AutoConfig
+
+    assert AutoConfig.from_pretrained(checkpoint).model_type == "qwen3"
+
+    assert rewrite_block_drafter_runtime_config("dflash", checkpoint, checkpoint)
+    assert json.loads(
+        (checkpoint / "speco_training_config.json").read_text(encoding="utf-8")
+    ) == training_config
+
+
+def test_rewrite_dflash_checkpoint_rejects_internal_source_config(tmp_path) -> None:
+    checkpoint = tmp_path / "draft_step_20"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "dflash"}), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        DrafterCheckpointMetadataError,
+        match="Cannot derive a runtime-facing block drafter config",
+    ):
+        rewrite_block_drafter_runtime_config("dflash", checkpoint, checkpoint)
 
 
 def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) -> None:

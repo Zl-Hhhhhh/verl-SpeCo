@@ -13,6 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import json
 import re
 import sys
 import types
@@ -28,14 +31,28 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
+    _attach_vllm_speculative_trace_events,
+    _build_vllm_speculative_trace_diagnostics,
+    _build_vllm_speculative_trace_events,
+    _compute_vllm_draft_teacher_logprobs,
+    _configure_dspark_swa_window_from_runtime_model,
+    _crop_vllm_ascend_dspark_group_block_tables,
     _describe_vllm_draft_logits,
+    _install_vllm_trace_on_async_llm,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
+    _pop_frontend_vllm_speculative_trace,
+    _pop_frontend_vllm_speculative_trace_diagnostics,
+    _pop_vllm_trace_spool,
+    _preload_vllm_ascend_ops,
+    _record_frontend_vllm_speculative_traces,
     _record_vllm_spec_decode_scheduler_stats,
+    _serialize_vllm_engine_startup,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
+    _validate_vllm_ascend_dspark_swa_adapter,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -43,10 +60,27 @@ from verl_speco.integration.vllm_runtime import (
     build_vllm_speculative_config_from_drafter,
     configure_vllm_runtime_from_config,
     patch_transformers_attention_layer_type_constants,
+    patch_vllm_async_llm_speculative_trace,
+    patch_vllm_core_client_speculative_trace,
+    _persist_finished_vllm_speculative_traces,
     patch_verl_bucketed_weight_transfer_npu_staging,
     patch_verl_bucketed_weight_transfer_shm_reuse,
     speco_vllm_update_draft_weights,
 )
+
+
+def test_vllm_engine_startup_lock_excludes_other_openers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    lock_path = tmp_path / "engine-startup.lock"
+    monkeypatch.setenv("VERL_SPECO_VLLM_ENGINE_STARTUP_LOCK", str(lock_path))
+
+    with _serialize_vllm_engine_startup():
+        with lock_path.open("a+", encoding="utf-8") as competing_lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(
+                    competing_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
 
 
 def _drafter(**overrides):
@@ -94,6 +128,82 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_npu_wake_skips_file_draft_reload(monkeypatch) -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    monkeypatch.setattr(extension, "_speco_is_dflash_draft", lambda: True)
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._speco_is_npu_vllm_worker",
+        lambda worker: True,
+    )
+    monkeypatch.setattr(
+        extension,
+        "_speco_resolve_draft_model",
+        lambda: pytest.fail("NPU wake-up must not read a draft checkpoint"),
+    )
+
+    assert extension._speco_reload_draft_from_checkpoint() == 0
+    assert "_speco_live_draft_weights_loaded = True" in getsource(
+        SpecoVLLMColocateWorkerExtension.update_draft_weights_from_ipc
+    )
+
+
+class _DraftModelForCheckpointReload:
+    def __init__(self) -> None:
+        self.loaded_weights = []
+
+    def load_weights(self, weights) -> None:
+        self.loaded_weights = list(weights)
+
+
+def _checkpoint_reload_extension(checkpoint_path: Path):
+    extension = SpecoVLLMColocateWorkerExtension()
+    draft_model = _DraftModelForCheckpointReload()
+    extension.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                draft_model_config=SimpleNamespace(model=str(checkpoint_path))
+            )
+        )
+    )
+    extension._speco_is_dflash_draft = lambda: True
+    extension._speco_resolve_draft_model = lambda: (draft_model, None)
+    return extension, draft_model
+
+
+def test_vllm_checkpoint_fallback_loads_pytorch_bin(monkeypatch, tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    torch.save({"draft.weight": torch.tensor([1.0, 2.0])}, tmp_path / "pytorch_model.bin")
+    extension, draft_model = _checkpoint_reload_extension(tmp_path)
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._speco_is_npu_vllm_worker",
+        lambda worker: False,
+    )
+
+    assert extension._speco_reload_draft_from_checkpoint() == 1
+    assert draft_model.loaded_weights[0][0] == "draft.weight"
+    assert draft_model.loaded_weights[0][1].tolist() == [1.0, 2.0]
+
+
+def test_vllm_checkpoint_fallback_loads_indexed_pytorch_bins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    torch = pytest.importorskip("torch")
+    torch.save({"draft.a": torch.tensor([1.0])}, tmp_path / "part-0.bin")
+    torch.save({"draft.b": torch.tensor([2.0])}, tmp_path / "part-1.bin")
+    (tmp_path / "pytorch_model.bin.index.json").write_text(
+        '{"weight_map":{"draft.a":"part-0.bin","draft.b":"part-1.bin"}}',
+        encoding="utf-8",
+    )
+    extension, draft_model = _checkpoint_reload_extension(tmp_path)
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._speco_is_npu_vllm_worker",
+        lambda worker: False,
+    )
+
+    assert extension._speco_reload_draft_from_checkpoint() == 2
+    assert [name for name, _ in draft_model.loaded_weights] == ["draft.a", "draft.b"]
 
 
 def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
@@ -294,6 +404,19 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     }
 
 
+def test_vllm_speculative_config_prefers_loadable_model_over_checkpoint_root() -> None:
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DFLASH",
+            model_path="/checkpoints/drafter/draft_step_20",
+            checkpoint_path="/checkpoints/drafter",
+            rollout={"spec_verify_tokens": 16},
+        )
+    )
+
+    assert config["model"] == "/checkpoints/drafter/draft_step_20"
+
+
 def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(
     tmp_path, monkeypatch
 ) -> None:
@@ -331,7 +454,7 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(
     }
 
 
-def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
+def test_vllm_speculative_config_maps_dspark_to_native_npu_contract(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(
@@ -360,10 +483,96 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
 
     assert config == {
         "draft_sample_method": "greedy",
-        "method": "dflash",
+        "method": "dspark",
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
+
+
+def test_vllm_dspark_uniform_swa_uses_config_only_runtime_overlay(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    source_config = {
+        "architectures": ["Qwen3DSparkModel"],
+        "markov_head_type": "vanilla",
+        "target_layer_ids": [1, 9, 17, 25, 33],
+        "dflash_config": {"target_layer_ids": [1, 9, 17, 25, 33]},
+    }
+    (model_path / "config.json").write_text(
+        json.dumps(source_config), encoding="utf-8"
+    )
+    (model_path / "model.safetensors").write_bytes(b"weights")
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_verify_tokens": 7},
+            vllm={
+                "dspark_attention_mode": "swa",
+                "dspark_context_window": 1024,
+                "dspark_runtime_overlay_root": str(tmp_path / "overlays"),
+            },
+        )
+    )
+
+    runtime_model_path = config["model"]
+    assert runtime_model_path != str(model_path)
+    runtime_config = json.loads(
+        (Path(runtime_model_path) / "config.json").read_text(encoding="utf-8")
+    )
+    assert runtime_config["dflash_config"]["use_swa"] is True
+    # The public context window counts actor tokens. The runtime window also
+    # includes all seven mutually visible DSpark query tokens.
+    assert runtime_config["dflash_config"]["swa_window_size"] == 1031
+    assert runtime_config["dflash_config"]["causal"] is False
+    assert runtime_config["sliding_window"] == 1031
+    engine_kwargs = {"speculative_config": config}
+    assert _configure_dspark_swa_window_from_runtime_model(engine_kwargs) == 1031
+    assert engine_kwargs["additional_config"] == {"draft_window_size": 1031}
+    assert (Path(runtime_model_path) / "model.safetensors").is_symlink()
+    assert json.loads((model_path / "config.json").read_text(encoding="utf-8")) == source_config
+
+
+@pytest.mark.parametrize("mode", ["hybrid", "sparse_global"])
+def test_vllm_dspark_mixed_attention_modes_fail_closed(
+    tmp_path, monkeypatch, mode
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "markov_head_type": "vanilla",
+                "target_layer_ids": [1, 9, 17, 25, 33],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(NotImplementedError, match="mixed full/sliding layers"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_verify_tokens": 7},
+                vllm={
+                    "dspark_attention_mode": mode,
+                    "dspark_context_window": 1024,
+                },
+            )
+        )
 
 
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
@@ -544,7 +753,7 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
-def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
+def test_vllm_runtime_injects_native_dspark_on_npu_and_worker_extension(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setattr(
@@ -577,9 +786,148 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     configure_vllm_runtime_from_config(config)
 
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
-    assert engine_kwargs["speculative_config"]["method"] == "dflash"
+    assert engine_kwargs["speculative_config"]["method"] == "dspark"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
+    assert "additional_config" not in engine_kwargs
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_runtime_prepares_dspark_swa_adapter_from_cpu_driver(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_verify_tokens": 7},
+                    vllm={
+                        "dspark_attention_mode": "swa",
+                        "dspark_context_window": 512,
+                        "dspark_runtime_overlay_root": str(tmp_path / "overlays"),
+                    },
+                ),
+                "engine_kwargs": {
+                    "vllm": {"additional_config": {"unrelated_option": "preserved"}}
+                },
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["additional_config"] == {
+        "unrelated_option": "preserved",
+        "draft_window_size": 519,
+    }
+    runtime_config = json.loads(
+        (
+            Path(engine_kwargs["speculative_config"]["model"]) / "config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert runtime_config["dflash_config"]["swa_window_size"] == 519
+
+
+def test_vllm_runtime_rejects_conflicting_dspark_swa_adapter_window(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_verify_tokens": 7},
+                    vllm={
+                        "dspark_attention_mode": "swa",
+                        "dspark_context_window": 512,
+                        "dspark_runtime_overlay_root": str(tmp_path / "overlays"),
+                    },
+                ),
+                "engine_kwargs": {
+                    "vllm": {"additional_config": {"draft_window_size": 512}}
+                },
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match=r"512 \+ 7 = 519"):
+        configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_dspark_swa_adapter_validation_fails_closed() -> None:
+    hf_config = {
+        "architectures": ["Qwen3DSparkModel"],
+        "markov_head_type": "vanilla",
+        "dflash_config": {"use_swa": True, "swa_window_size": 519},
+    }
+    proposer = SimpleNamespace(
+        draft_model_config=SimpleNamespace(hf_config=hf_config),
+        draft_window_size=519,
+        sliding_window=SimpleNamespace(window_size=519),
+    )
+
+    assert _validate_vllm_ascend_dspark_swa_adapter(proposer) is True
+
+    proposer.sliding_window = None
+    with pytest.raises(RuntimeError, match="SlidingWindowAdapter"):
+        _validate_vllm_ascend_dspark_swa_adapter(proposer)
+
+
+def test_vllm_dspark_swa_crops_every_native_kv_cache_group() -> None:
+    torch = pytest.importorskip("torch")
+    proposer = SimpleNamespace(
+        draft_window_size=10,
+        sliding_window=SimpleNamespace(
+            block_size=4,
+            max_window_blocks=4,
+            start_tokens_in_window_rounding=torch.tensor([8]),
+            _windowed_seq_lens=torch.tensor([12]),
+        ),
+        _per_group_kernel_block_sizes={0: 4, 1: 4},
+        _per_group_block_table_buffers={
+            0: torch.tensor([[10, 11, 12, 13, 14, 15]]),
+            1: torch.tensor([[20, 21, 22, 23, 24, 25]]),
+        },
+    )
+
+    assert _crop_vllm_ascend_dspark_group_block_tables(proposer) == 2
+    assert proposer._per_group_block_table_buffers[0].tolist() == [
+        [12, 13, 14, 0]
+    ]
+    assert proposer._per_group_block_table_buffers[1].tolist() == [
+        [22, 23, 24, 0]
+    ]
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
@@ -636,6 +984,326 @@ def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
     }
 
 
+def test_vllm_speculative_trace_records_real_verify_event() -> None:
+    request = SimpleNamespace(_output_token_ids=[101, 102], is_finished=lambda: False)
+    scheduler = SimpleNamespace(requests={"request-1": request})
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"request-1": [11, 12, 13]}
+    )
+    model_output = SimpleNamespace(
+        sampled_token_ids=[[11, 99]],
+        req_id_to_index={"request-1": 0},
+        _speco_verified_draft_teacher_logprobs_by_request={
+            "request-1": [-0.1, -2.0, -3.0]
+        },
+    )
+
+    traces = _build_vllm_speculative_trace_events(
+        scheduler, scheduler_output, model_output
+    )
+
+    assert traces["request-1"] == [
+        {
+            "response_start": 2,
+            "draft_token_ids": [11, 12, 13],
+            "draft_teacher_logprobs": [-0.1, -2.0, -3.0],
+            "verified_token_ids": [11, 99],
+            "accepted_token_ids": [11],
+            "accepted_count": 1,
+            "draft_count": 3,
+            "all_drafts_accepted": False,
+            "verification_token_kind": "replacement",
+            "rejected_draft_token_id": 12,
+            "verification_token_id": 99,
+        }
+    ]
+
+    core_output = SimpleNamespace(
+        request_id="request-1", new_token_ids=[11, 99], kv_transfer_params=None
+    )
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[core_output])}, traces
+    )
+    _record_frontend_vllm_speculative_traces([core_output])
+    captured = _pop_frontend_vllm_speculative_trace("request-1")
+
+    assert captured[0]["emitted_token_ids"] == [11, 99]
+    assert core_output.kv_transfer_params is None
+
+
+def test_vllm_verify_teacher_logprobs_are_gathered_per_draft_token() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.tensor(
+        [[0.0, 2.0, -1.0], [3.0, 0.0, 1.0], [0.5, 0.5, 0.5]]
+    )
+    metadata = SimpleNamespace(
+        target_logits_indices=torch.tensor([0, 2]),
+        draft_token_ids=torch.tensor([1, 2]),
+    )
+
+    actual = _compute_vllm_draft_teacher_logprobs(logits, metadata)
+    expected = torch.log_softmax(logits[[0, 2]], dim=-1)[
+        torch.arange(2), metadata.draft_token_ids
+    ]
+
+    assert torch.allclose(actual, expected)
+
+
+def test_vllm_frontend_trace_normalizes_randomized_request_id() -> None:
+    internal_request_id = "request-external-deadbeef"
+    core_output = SimpleNamespace(
+        request_id=internal_request_id,
+        new_token_ids=[11],
+        kv_transfer_params=None,
+    )
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[core_output])},
+        {internal_request_id: [{"accepted_count": 1, "draft_count": 1}]},
+    )
+
+    _record_frontend_vllm_speculative_traces([core_output])
+
+    captured = _pop_frontend_vllm_speculative_trace("request-external")
+    assert captured == [
+        {"accepted_count": 1, "draft_count": 1, "emitted_token_ids": [11]}
+    ]
+
+
+def test_vllm_speculative_trace_survives_real_msgpack_boundary() -> None:
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    request = SimpleNamespace(_output_token_ids=[101], is_finished=lambda: False)
+    scheduler = SimpleNamespace(
+        requests={"request-msgpack": request}, num_sampled_tokens_per_step=1
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"request-msgpack": [11, 12, 13]}
+    )
+    model_output = SimpleNamespace(
+        sampled_token_ids=[[11, 12, 99]],
+        req_id_to_index={"request-msgpack": 0},
+    )
+    traces = _build_vllm_speculative_trace_events(
+        scheduler, scheduler_output, model_output
+    )
+    diagnostics = _build_vllm_speculative_trace_diagnostics(
+        scheduler, scheduler_output, model_output, traces
+    )
+    core_output = EngineCoreOutput(
+        request_id="request-msgpack", new_token_ids=[11, 12, 99]
+    )
+    _attach_vllm_speculative_trace_events(
+        {0: EngineCoreOutputs(outputs=[core_output])}, traces, diagnostics
+    )
+
+    wire_frames = MsgpackEncoder().encode(EngineCoreOutputs(outputs=[core_output]))
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(wire_frames)
+    _record_frontend_vllm_speculative_traces(decoded.outputs)
+
+    captured = _pop_frontend_vllm_speculative_trace("request-msgpack")
+    captured_diagnostics = _pop_frontend_vllm_speculative_trace_diagnostics(
+        "request-msgpack"
+    )
+    assert captured[0]["accepted_count"] == 2
+    assert captured[0]["emitted_token_ids"] == [11, 12, 99]
+    assert captured_diagnostics["engine_built_events"] == 1
+    assert captured_diagnostics["frontend_received_events"] == 1
+
+
+def test_vllm_trace_spool_crosses_process_boundary(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("VERL_SPECO_VLLM_TRACE_SPOOL_DIR", str(tmp_path))
+    pending_traces = {
+        "request-spool-deadbeef": [{"accepted_count": 2, "draft_count": 3}]
+    }
+    pending_diagnostics = {
+        "request-spool-deadbeef": {"engine_built_events": 1}
+    }
+    output = SimpleNamespace(
+        request_id="request-spool-deadbeef", finish_reason="length"
+    )
+
+    _persist_finished_vllm_speculative_traces(
+        {0: SimpleNamespace(outputs=[output])},
+        pending_traces,
+        pending_diagnostics,
+    )
+    events, diagnostics = _pop_vllm_trace_spool("request-spool")
+
+    assert events == [{"accepted_count": 2, "draft_count": 3}]
+    assert diagnostics["engine_built_events"] == 1
+    assert diagnostics["engine_spooled_events"] == 1
+    assert pending_traces == {}
+    assert pending_diagnostics == {}
+    assert _pop_vllm_trace_spool("request-spool") == ([], {})
+
+
+def test_vllm_core_client_collects_trace_after_deserialization(monkeypatch) -> None:
+    from vllm.v1.engine.core_client import AsyncMPClient
+
+    core_output = SimpleNamespace(
+        request_id="request-client",
+        new_token_ids=[11, 99],
+        kv_transfer_params=None,
+    )
+    traces = {
+        "request-client": [
+            {
+                "response_start": 0,
+                "draft_token_ids": [11, 12],
+                "verified_token_ids": [11, 99],
+                "accepted_token_ids": [11],
+                "accepted_count": 1,
+                "draft_count": 2,
+                "all_drafts_accepted": False,
+                "verification_token_kind": "replacement",
+                "rejected_draft_token_id": 12,
+                "verification_token_id": 99,
+            }
+        ]
+    }
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[core_output])}, traces
+    )
+
+    async def fake_get_output_async(self):
+        del self
+        return SimpleNamespace(outputs=[core_output])
+
+    monkeypatch.setattr(AsyncMPClient, "get_output_async", fake_get_output_async)
+    assert patch_vllm_core_client_speculative_trace() is True
+
+    client = object.__new__(AsyncMPClient)
+    asyncio.run(client.get_output_async())
+
+    captured = _pop_frontend_vllm_speculative_trace("request-client")
+    assert captured[0]["accepted_count"] == 1
+    assert core_output.kv_transfer_params is None
+
+
+def test_vllm_async_llm_stream_collects_request_output_trace(monkeypatch) -> None:
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    request_output = SimpleNamespace(
+        request_id="request-stream",
+        new_token_ids=[11, 99],
+        kv_transfer_params=None,
+    )
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[request_output])},
+        {"request-stream": [{"accepted_count": 1, "draft_count": 2}]},
+    )
+
+    async def fake_generate(self):
+        del self
+        yield request_output
+
+    monkeypatch.setattr(AsyncLLM, "generate", fake_generate)
+    assert patch_vllm_async_llm_speculative_trace() is True
+
+    async def consume():
+        client = object.__new__(AsyncLLM)
+        return [output async for output in client.generate()]
+
+    assert asyncio.run(consume()) == [request_output]
+    captured = _pop_frontend_vllm_speculative_trace("request-stream")
+    assert captured[0]["accepted_count"] == 1
+    assert request_output.kv_transfer_params is None
+
+
+def test_vllm_async_llm_instance_hook_collects_trace() -> None:
+    calls = []
+
+    class OutputProcessor:
+        def process_outputs(self, outputs, timestamp):
+            calls.append((outputs, timestamp))
+            return "processed"
+
+    engine = SimpleNamespace(output_processor=OutputProcessor())
+    core_output = SimpleNamespace(
+        request_id="request-instance",
+        new_token_ids=[11, 99],
+        kv_transfer_params=None,
+    )
+    traces = {
+        "request-instance": [
+            {
+                "accepted_count": 1,
+                "draft_count": 2,
+            }
+        ]
+    }
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[core_output])}, traces
+    )
+
+    assert _install_vllm_trace_on_async_llm(engine) is True
+    assert engine.output_processor.process_outputs([core_output], 1.25) == "processed"
+
+    captured = _pop_frontend_vllm_speculative_trace("request-instance")
+    assert captured[0]["accepted_count"] == 1
+    assert calls == [([core_output], 1.25)]
+
+
+def test_vllm_async_llm_hook_supports_slotted_output_processor() -> None:
+    calls = []
+
+    class OutputProcessor:
+        __slots__ = ()
+
+        def process_outputs(self, outputs):
+            calls.append(outputs)
+            return "processed"
+
+    engine = SimpleNamespace(output_processor=OutputProcessor())
+    core_output = SimpleNamespace(
+        request_id="request-slotted",
+        new_token_ids=[11],
+        kv_transfer_params=None,
+    )
+    _attach_vllm_speculative_trace_events(
+        {0: SimpleNamespace(outputs=[core_output])},
+        {"request-slotted": [{"accepted_count": 1, "draft_count": 1}]},
+    )
+
+    assert _install_vllm_trace_on_async_llm(engine) is True
+    assert engine.output_processor.process_outputs([core_output]) == "processed"
+    assert _pop_frontend_vllm_speculative_trace("request-slotted")
+    assert calls == [[core_output]]
+
+
+def test_vllm_trace_uses_async_scheduler_sample_count() -> None:
+    request = SimpleNamespace(_output_token_ids=[], is_finished=lambda: False)
+    scheduler = SimpleNamespace(
+        requests={"request-async": request}, num_sampled_tokens_per_step=0
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"request-async": [-1, -1]}
+    )
+    model_output = SimpleNamespace(
+        sampled_token_ids=[[11]],
+        req_id_to_index={"request-async": 0},
+        _speco_verified_draft_token_ids_by_request={"request-async": [11, 12]},
+        _speco_verified_draft_teacher_logprobs_by_request={
+            "request-async": [-0.1, -2.0]
+        },
+    )
+
+    traces = _build_vllm_speculative_trace_events(
+        scheduler, scheduler_output, model_output
+    )
+
+    assert traces["request-async"][0]["accepted_count"] == 1
+    assert traces["request-async"][0]["draft_token_ids"] == [11, 12]
+    assert traces["request-async"][0]["draft_teacher_logprobs"] == [-0.1, -2.0]
+    diagnostics = _build_vllm_speculative_trace_diagnostics(
+        scheduler, scheduler_output, model_output, traces
+    )
+    assert diagnostics["request-async"]["engine_verified_draft_ids_present"] == 1
+    assert diagnostics["request-async"]["engine_teacher_logprobs_present"] == 1
+    assert diagnostics["request-async"]["engine_teacher_logprob_tokens"] == 2
+
+
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
     trainer_source = (
         Path(__file__).resolve().parents[2]
@@ -645,6 +1313,18 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     ).read_text(encoding="utf-8")
 
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
+
+
+def test_vllm_ascend_ops_preload_is_optional_and_imports_when_available(monkeypatch) -> None:
+    imported = []
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.setattr("importlib.import_module", lambda name: imported.append(name))
+
+    assert _preload_vllm_ascend_ops() is True
+    assert imported == ["vllm_ascend.ops"]
+
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    assert _preload_vllm_ascend_ops() is False
 
 
 def test_vllm_draft_update_attachment_is_idempotent() -> None:

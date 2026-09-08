@@ -13,6 +13,10 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -118,3 +122,77 @@ def test_dp_local_loss_scaling_recovers_global_token_mean_gradient(monkeypatch):
 
     fsdp_mean_grad = (per_rank_grads[0] + per_rank_grads[1]) / 2.0
     assert torch.allclose(fsdp_mean_grad, weight_ref.grad, atol=1e-6)
+
+
+@pytest.mark.parametrize("counts", [(1, 3), (0, 3), (0, 0)])
+def test_auxiliary_ce_uses_global_first_rejection_mean_including_empty_ranks(monkeypatch, counts):
+    torch.manual_seed(13)
+    rank_inputs = [torch.randn(n, 4) for n in counts]
+    reference_weight = torch.randn(4, 7, requires_grad=True)
+
+    def loss_sum(weight, inputs):
+        return .2 * torch.nn.functional.cross_entropy(
+            inputs @ weight, torch.zeros(len(inputs), dtype=torch.long), reduction="sum"
+        )
+
+    reference = sum(loss_sum(reference_weight, x) for x in rank_inputs) / max(sum(counts), 1)
+    reference.backward()
+    gradients = []
+    for rank in (0, 1):
+        weight = reference_weight.detach().clone().requires_grad_(True)
+        trainer = _bare_trainer(dp_size=2, dp_group="dp")
+        other = 1 - rank
+        other_metrics = torch.stack([
+            torch.zeros(()), loss_sum(reference_weight.detach(), rank_inputs[other]),
+            torch.tensor(float(counts[other])),
+        ])
+        monkeypatch.setattr(base_trainer_mod.dist, "all_reduce", lambda t, group=None: t.add_(other_metrics))
+        metric, backward, count = trainer._reduce_auxiliary_loss({
+            # The base token count deliberately differs from the auxiliary one.
+            "total_local_ploss": torch.tensor(100.), "local_num_tokens": torch.tensor(80.),
+            "auxiliary_loss": {"loss_sum": loss_sum(weight, rank_inputs[rank]),
+                               "token_count": torch.tensor(float(counts[rank]))},
+        })
+        assert count.item() == sum(counts)
+        assert metric.item() == pytest.approx(reference.item())
+        backward.backward()
+        gradients.append(weight.grad)
+    assert torch.allclose(sum(gradients) / 2, reference_weight.grad, atol=1e-6)
+
+
+def test_disabled_auxiliary_loss_does_not_reduce(monkeypatch):
+    trainer = _bare_trainer(dp_size=2, dp_group="dp")
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled auxiliary objective must not introduce a collective")
+    monkeypatch.setattr(base_trainer_mod.dist, "all_reduce", unexpected)
+    assert all(v.item() == 0 for v in trainer._reduce_auxiliary_loss({"total_local_ploss": torch.tensor(3.)}))
+
+
+def test_optimizer_step_includes_separately_normalized_auxiliary_gradient(monkeypatch):
+    trainer = _bare_trainer()
+    trainer.model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        trainer.model.weight.fill_(.3)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.1)
+    trainer.lr_scheduler = None
+    trainer.optimizer_steps_total = trainer.training_steps = 0
+    trainer._current_pad_size = 0
+    trainer._training_metric_sums = {}
+    trainer._ulysses_group_context = nullcontext
+    trainer._record_dflash_training_metrics = lambda value: None
+    trainer._maybe_dump_dspark_k3_logprobs = lambda *args, **kwargs: None
+    monkeypatch.setattr(base_trainer_mod, "device_name", "cpu")
+
+    def compute_loss(model, batch, pad):
+        w = model.weight.squeeze()
+        return {
+            "total_local_vloss": w * 0, "total_local_ploss": 80 * w.square(),
+            "local_num_tokens": torch.tensor(80.), "v_weight": 0., "p_weight": 1.,
+            "auxiliary_loss": {"loss_sum": .2 * 3 * (w - 1).square(), "token_count": torch.tensor(3.)},
+        }
+    trainer.backend = SimpleNamespace(compute_loss=compute_loss)
+    assert asyncio.run(trainer._training_step_on_batch({}, 1))
+    # d/dw [w^2 + .2*(w-1)^2] at .3 = .32, below grad clip=1.
+    assert trainer.model.weight.item() == pytest.approx(.3 - .1 * .32)
+    assert trainer._training_metric_sums["drafter/train_loss_sum"] == pytest.approx(.3**2 + .2 * .7**2)
+    assert trainer.optimizer_steps_total == 1
