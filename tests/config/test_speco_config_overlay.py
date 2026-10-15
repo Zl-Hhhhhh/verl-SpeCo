@@ -87,6 +87,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.dspark_accepted_k3_alpha == pytest.approx(1.0)
     assert drafter.training.dspark_accepted_fkl_alpha == pytest.approx(0.0)
     assert drafter.training.dspark_rejected_k3_alpha == pytest.approx(1.0)
+    assert drafter.training.dspark_rejected_aux_alpha == pytest.approx(0.0)
+    assert drafter.training.dspark_rejected_prefix_length == 0
     assert drafter.training.dspark_response_stream_weight == pytest.approx(1.0)
     assert drafter.training.dspark_rejected_stream_weight == pytest.approx(1.0)
     assert drafter.training.dspark_rejected_position_decay == pytest.approx(0.9)

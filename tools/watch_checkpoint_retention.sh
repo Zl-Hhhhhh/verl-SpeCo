@@ -11,6 +11,14 @@ done_sentinel=$2
 poll_seconds=${3:-30}
 protected_draft_step=
 protected_actor_steps=()
+protected_draft_steps=()
+if [[ -n "${SPECO_PROTECTED_DRAFTER_STEPS:-}" ]]; then
+    IFS=',' read -r -a protected_draft_steps <<< "${SPECO_PROTECTED_DRAFTER_STEPS}"
+    for protected_step in "${protected_draft_steps[@]}"; do
+        [[ "${protected_step}" =~ ^[0-9]+$ ]] \
+            || { echo "invalid SPECO_PROTECTED_DRAFTER_STEPS entry: ${protected_step}" >&2; exit 2; }
+    done
+fi
 if [[ -n "${SPECO_PROTECTED_ACTOR_STEPS:-}" ]]; then
     IFS=',' read -r -a protected_actor_steps <<< "${SPECO_PROTECTED_ACTOR_STEPS}"
     for protected_actor_step in "${protected_actor_steps[@]}"; do
@@ -24,6 +32,15 @@ is_protected_actor_step() {
     local protected_actor_step
     for protected_actor_step in "${protected_actor_steps[@]}"; do
         [[ "${candidate}" == "${protected_actor_step}" ]] && return 0
+    done
+    return 1
+}
+
+is_protected_draft_step() {
+    local candidate=$1
+    local protected_step
+    for protected_step in "${protected_draft_steps[@]}"; do
+        [[ "${candidate}" == "${protected_step}" ]] && return 0
     done
     return 1
 }
@@ -113,7 +130,8 @@ while [[ ! -f "${done_sentinel}" ]]; do
                     && "${draft_step}" != "${protected_draft_step}" \
                     && "${draft_step}" != "${best_draft_step}" \
                     && "${draft_step}" != "${best_acceptance_step}" \
-                    && "${draft_step}" != "${best_throughput_step}" ]]; then
+                    && "${draft_step}" != "${best_throughput_step}" ]] \
+                    && ! is_protected_draft_step "${draft_step}"; then
                     rm -rf -- "${draft_path}"
                 fi
             done

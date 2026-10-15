@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import asyncio
+
+import pytest
 
 from verl_speco.integration.agent_loop_runtime import (
     _CURRENT_MAX_TOKENS,
@@ -94,3 +97,31 @@ def test_multi_turn_agent_loop_accumulates_trace_diagnostics() -> None:
         assert diagnostics["agent_trace_events_received"] == 1
     finally:
         _CURRENT_SPEC_TRACE_HISTORY.reset(history_token)
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_vllm_boundary_preserves_cap_and_strips_private_metadata(positional):
+    from vllm import SamplingParams
+    from verl_speco.integration.vllm_runtime import _SpecoVLLMHttpServerMixin
+
+    class Upstream:
+        async def generate(self, prompt_ids, sampling_params, request_id):
+            parsed = SamplingParams(**sampling_params)
+            assert parsed.max_tokens == 512
+            assert parsed.temperature == 0
+            assert not any(k.startswith("_verl_") for k in sampling_params)
+            sampling_params.pop("max_tokens")
+            return SimpleNamespace(extra_fields=None)
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    params = dict(max_tokens=512, temperature=0, _verl_global_steps=5,
+                  _verl_skip_drafter_collection=True)
+    original = params.copy()
+    server = Server()
+    if positional:
+        asyncio.run(server.generate([1], params, "probe"))
+    else:
+        asyncio.run(server.generate(prompt_ids=[1], sampling_params=params, request_id="probe"))
+    assert params == original

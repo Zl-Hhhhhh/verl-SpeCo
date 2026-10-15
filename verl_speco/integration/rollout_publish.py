@@ -20,6 +20,7 @@ import time
 from typing import Any, Optional, cast
 
 from verl_speco.trainer.checkpoint import trim_process_host_memory
+from verl_speco.trainer.state_diagnostics import record_rollout_publish
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -516,7 +517,9 @@ class DraftWeightPublishMixin:
                 len(weights) if weights else 0,
             )
         try:
+            record_rollout_publish(weights, global_steps, "send")
             await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+            record_rollout_publish(weights, global_steps, "ack")
         finally:
             if used_ref:
                 release_started = time.perf_counter()
@@ -545,7 +548,9 @@ class DraftWeightPublishMixin:
                 len(weights) if weights else 0,
             )
         try:
+            record_rollout_publish(weights, global_steps, "send")
             await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+            record_rollout_publish(weights, global_steps, "ack")
         finally:
             if used_ref:
                 release_started = time.perf_counter()

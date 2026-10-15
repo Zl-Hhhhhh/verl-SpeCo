@@ -1,5 +1,7 @@
 # DSpark top-16 options and half-node recipe
 
+> Historical record: the half-node and P4 wrapper scripts were removed on 2026-09-09. Use `tools/run_dspark_vllm_experiment.sh` with explicit device, dataset and attention settings for new runs; wrapper commands below describe the original experiments.
+
 Prepared on 2026-09-05. No 101-step training job is launched by this change.
 Reference: the completed P2_02 true-SWA-512 run, W&B `2a6b95c4b0fc`.
 See `p2_02_true_swa512_runtime_topk_assessment_2026-09-05.md` for the timing and K3-tail evidence.

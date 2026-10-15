@@ -219,7 +219,7 @@ test.parquet   a94a87fd700142538db1d0e089e81ca98be477c4208163301adb66aab5979bb6
 
 ### 16 逻辑设备的完整命令
 
-`tools/run_dspark_p4.sh` 经 half-node wrapper **强制**设备 8–15、worker=8。外部设置 `N_GPUS=16` 会被覆盖，其他可见设备列表还会被拒绝。因此这里直接用现有通用入口 `tools/run_dspark_vllm_experiment.sh`，不另建脚本。
+半节点及 P4 wrapper 已于 2026-09-09 删除。新实验统一使用通用入口 `tools/run_dspark_vllm_experiment.sh`，显式设置设备数、数据集与注意力配置。下方命令保留本次迁移的 16 设备配置。
 
 在新 shell / tmux 会话使用以下命令。设备列表是新机全部 16 个逻辑设备均空闲时的例子；若只获得 8 个，按上表恢复 8 设备参数并填写实际逻辑编号。新标签 `p4_03_migrate16` 可改为自己的命名；不要与旧 run 复用 ID 或 checkpoint 目录。可额外设置自己的 `WANDB_ENTITY`。
 

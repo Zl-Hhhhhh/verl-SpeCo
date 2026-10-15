@@ -20,12 +20,15 @@ dependency.
 """
 
 import logging
+import hashlib
+import json
 import os
 import random
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Optional, cast
 
 import numpy as np
@@ -841,68 +844,7 @@ class SpecoWorker(Worker):
             sample_id = sample.get("sample_id")
             if sample_id not in (None, ""):
                 result["received_sample_ids"].append(str(sample_id))
-            batch = {
-                "input_ids": sample["input_ids"],
-                "prompts": sample["prompts"],
-                "responses": sample["responses"],
-            }
-            for key in (
-                "hidden_position_start",
-                "hidden_position_end",
-                "hidden_positions",
-                "hidden_prefix_cache_rows",
-                "hidden_window_start",
-                "hidden_window_end",
-                "hidden_lm_head_fingerprint",
-                "hidden_last_hidden_logprob_check",
-                "hidden_target_logprobs_source",
-                "hidden_raw_topk_logprob_check",
-                "hidden_raw_target_logprobs",
-                "hidden_raw_target_logprobs_positions",
-                "hidden_raw_target_logprobs_position_start",
-                "hidden_raw_target_logprobs_position_end",
-                "hidden_last_hidden_filter",
-                "hidden_last_hidden_select",
-                "hidden_states_layout",
-                "target_logprobs_position_start",
-                "target_logprobs_position_end",
-                "hidden_window_stratum",
-                "speculative_trace",
-                "speculative_trace_diagnostics",
-                "sample_id",
-                "global_step",
-            ):
-                if key in sample:
-                    batch[key] = sample[key]
-            hidden = sample.get("hidden_states")
-            if hidden is None:
-                hidden_chunks = sample.get("hidden_states_ref_chunks")
-                if hidden_chunks:
-                    expected_rows = None
-                    hidden_positions = batch.get("hidden_positions")
-                    if torch.is_tensor(hidden_positions):
-                        hidden_positions = cast(torch.Tensor, hidden_positions)
-                        expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(
-                        hidden_chunks, expected_rows=expected_rows
-                    )
-                else:
-                    hidden_positions = batch.get("hidden_positions")
-                    expected_rows = (
-                        int(hidden_positions.numel())
-                        if torch.is_tensor(hidden_positions)
-                        else None
-                    )
-                    hidden = _resolve_sample_hidden_state_ref(
-                        sample.get("hidden_states_ref"),
-                        sample.get("hidden_states_ref_meta"),
-                        expected_rows=expected_rows,
-                    )
-            target_logprobs = sample.get("target_logprobs")
-            if target_logprobs is None:
-                target_logprobs = _resolve_ray_object_ref(
-                    sample.get("target_logprobs_ref")
-                )
+            batch, hidden, target_logprobs = self._materialize_feature_sample(sample)
             if hidden is None:
                 result["missing_hidden_samples"] += 1
                 continue
@@ -917,6 +859,259 @@ class SpecoWorker(Worker):
         self._flush_rollout_features_for_step()
         result["unique_sample_ids"] = len(set(result["sample_ids"]))
         return result
+
+    @staticmethod
+    def _materialize_feature_sample(sample):
+        batch = {
+            "input_ids": sample["input_ids"],
+            "prompts": sample["prompts"],
+            "responses": sample["responses"],
+        }
+        for key in (
+            "hidden_position_start", "hidden_position_end", "hidden_positions",
+            "hidden_prefix_cache_rows", "hidden_window_start", "hidden_window_end",
+            "hidden_lm_head_fingerprint", "hidden_last_hidden_logprob_check",
+            "hidden_target_logprobs_source", "hidden_raw_topk_logprob_check",
+            "hidden_raw_target_logprobs", "hidden_raw_target_logprobs_positions",
+            "hidden_raw_target_logprobs_position_start",
+            "hidden_raw_target_logprobs_position_end", "hidden_last_hidden_filter",
+            "hidden_last_hidden_select", "hidden_states_layout",
+            "target_logprobs_position_start", "target_logprobs_position_end",
+            "hidden_window_stratum", "speculative_trace",
+            "low_entropy_sampling_active", "speculative_trace_diagnostics",
+            "sample_id", "global_step",
+        ):
+            if key in sample:
+                batch[key] = sample[key]
+        hidden = sample.get("hidden_states")
+        if hidden is None:
+            positions = batch.get("hidden_positions")
+            expected_rows = int(positions.numel()) if torch.is_tensor(positions) else None
+            chunks = sample.get("hidden_states_ref_chunks")
+            if chunks:
+                hidden = _resolve_hidden_state_chunks(chunks, expected_rows=expected_rows)
+            else:
+                hidden = _resolve_sample_hidden_state_ref(
+                    sample.get("hidden_states_ref"),
+                    sample.get("hidden_states_ref_meta"),
+                    expected_rows=expected_rows,
+                )
+        target_logprobs = sample.get("target_logprobs")
+        if target_logprobs is None:
+            target_logprobs = _resolve_ray_object_ref(sample.get("target_logprobs_ref"))
+        return batch, hidden, target_logprobs
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH),
+        blocking=False,
+    )
+    async def collect_directional_pair(
+        self, old_samples, new_samples, old_head_payload, source_step, actor_step
+    ):
+        from verl_speco.trainer.directional_sampling import (
+            matched_directional_selections, select_directional_anchors,
+        )
+
+        if not self.in_drafter_train_group or self.trainer is None:
+            return {"candidate_samples": 0, "selected_samples": 0, "selected_anchors": 0}
+        if self.last_global_step != int(actor_step):
+            raise ValueError("Directional pair uses the wrong current actor step")
+        old_by_id = {str(sample["sample_id"]): sample for sample in old_samples}
+        new_by_id = {str(sample["sample_id"]): sample for sample in new_samples}
+        if (
+            len(old_by_id) != len(old_samples)
+            or len(new_by_id) != len(new_samples)
+            or old_by_id.keys() != new_by_id.keys()
+            or not old_by_id
+        ):
+            raise ValueError("Directional pair sample IDs are missing or duplicated")
+        if any(int(sample["global_step"]) != int(source_step) for sample in old_samples):
+            raise ValueError("Directional old samples have the wrong source step")
+        if any(int(sample["global_step"]) != int(actor_step) for sample in new_samples):
+            raise ValueError("Directional new samples have the wrong actor step")
+        old_head = old_head_payload.get("weight") if isinstance(old_head_payload, dict) else None
+        if not torch.is_tensor(old_head) or old_head_payload.get("row_indices") is not None:
+            raise ValueError("Directional pair requires the full old actor output head")
+        diagnostic = bool(self.config.rollout.drafter.training.get(
+            "dspark_directional_diagnostic_enabled", False
+        ))
+        diagnostic_root = None
+        if diagnostic:
+            raw_root = str(self.config.rollout.drafter.training.get(
+                "dspark_directional_diagnostic_output", ""
+            ))
+            if not raw_root or raw_root in {"None", "null"}:
+                raise ValueError("Directional diagnostic needs an output directory")
+            diagnostic_root = Path(raw_root)
+            if self.is_drafter_group_leader:
+                diagnostic_root.mkdir(parents=True, exist_ok=True)
+
+        with _preserve_process_rng_state(self.device_name):
+            if not await self.trainer.activate_training_model():
+                raise RuntimeError("Cannot activate drafter for directional scoring")
+            candidates = []
+            stored_by_id = {}
+            diagnostic_candidates = []
+            for sample_id, new_sample in new_by_id.items():
+                if diagnostic and not torch.equal(
+                    old_by_id[sample_id]["input_ids"].reshape(-1),
+                    new_sample["input_ids"].reshape(-1),
+                ):
+                    raise ValueError("Directional diagnostic has different full token prefixes")
+                batch, hidden, target_logprobs = self._materialize_feature_sample(new_sample)
+                if hidden is None:
+                    raise ValueError("Directional new actor hidden states are missing")
+                before = len(self.trainer.collected_data)
+                if self._store_rollout_sample(batch, hidden, target_logprobs) != 1:
+                    raise ValueError("Directional new actor sample could not be stored")
+                if len(self.trainer.collected_data) <= before:
+                    if any(
+                        str(item.get("sample_id")) == sample_id
+                        for item in self.trainer.fixed_eval_data
+                    ):
+                        continue
+                    raise ValueError("Directional sample disappeared from the training buffer")
+                item = self.trainer.collected_data[-1]
+                if str(item.get("sample_id")) != sample_id:
+                    raise ValueError("Directional stored sample ID changed")
+                stored_by_id[sample_id] = item
+                old_batch, old_hidden, _ = self._materialize_feature_sample(old_by_id[sample_id])
+                if old_hidden is None:
+                    raise ValueError("Directional old actor hidden states are missing")
+                if diagnostic:
+                    scored = self.trainer.score_directional_candidates(
+                        item, old_batch, old_hidden, old_head, diagnostic=True
+                    )
+                    for row in scored["rows"]:
+                        candidates.append((sample_id, row["anchor"], row["m"], row["current_tv"]))
+                        if self.is_drafter_group_leader:
+                            diagnostic_candidates.append({"sample_id": sample_id, **row})
+                else:
+                    for anchor, m, tv in self.trainer.score_directional_candidates(
+                        item, old_batch, old_hidden, old_head
+                    ):
+                        candidates.append((sample_id, anchor, m, tv))
+
+            budget_per_sample = int(
+                self.config.rollout.drafter.training.get("dspark_num_anchors", 32)
+            )
+            matched_compare = bool(self.config.rollout.drafter.training.get(
+                "dspark_directional_compare_enabled", False
+            ))
+            if self.is_drafter_group_leader:
+                if matched_compare:
+                    by_sample = {sample_id: [] for sample_id in stored_by_id}
+                    for sample_id, anchor, m, tv in candidates:
+                        by_sample[sample_id].append((anchor, m, tv))
+                    selections = {
+                        sample_id: matched_directional_selections(
+                            entries, budget_per_sample,
+                            seed=int(self.config.rollout.drafter.training.get(
+                                "dspark_directional_compare_seed", 17
+                            )), sample_id=sample_id,
+                        ) for sample_id, entries in by_sample.items()
+                    }
+                    selected = {sample_id: arms["top_m"]
+                                for sample_id, arms in selections.items()}
+                else:
+                    by_sample = {sample_id: [] for sample_id in stored_by_id}
+                    for sample_id, anchor, m, _ in candidates:
+                        by_sample[sample_id].append((anchor, m))
+                    selected = {
+                        sample_id: select_directional_anchors(
+                            [anchor for anchor, _ in entries],
+                            torch.tensor([m for _, m in entries]),
+                            budget_per_sample,
+                        )
+                        for sample_id, entries in by_sample.items()
+                    }
+                    selections = None
+            else:
+                selected = None
+                selections = None
+            if self.training_process_group is not None:
+                payload = [(selected, selections)]
+                dist.broadcast_object_list(
+                    payload,
+                    src=self.training_group_ranks[0],
+                    group=self.training_process_group,
+                )
+                selected, selections = payload[0]
+            if selected is None:
+                raise RuntimeError("Directional anchor selection was not broadcast")
+            if matched_compare:
+                self._ablation_directional_candidates = candidates
+                self._ablation_directional_selections = selections
+            if diagnostic:
+                # All SP ranks participate in model forwards; only the leader persists a copy.
+                for sample_id, anchors in selected.items():
+                    if not anchors:
+                        continue
+                    old_batch, old_hidden, _ = self._materialize_feature_sample(old_by_id[sample_id])
+                    detailed = self.trainer.score_directional_candidates(
+                        stored_by_id[sample_id], old_batch, old_hidden, old_head,
+                        diagnostic=True, selected_anchors=anchors,
+                    )
+                    if {row["anchor"] for row in detailed["rows"]} != set(anchors):
+                        raise RuntimeError("Directional diagnostic lost selected anchors")
+                    if self.is_drafter_group_leader:
+                        slug = hashlib.sha256(sample_id.encode()).hexdigest()[:20]
+                        path = diagnostic_root / f"paired_rank{self.rank:02d}_{slug}.pt"
+                        if path.exists():
+                            raise FileExistsError(path)
+                        source_ids = old_by_id[sample_id]["input_ids"].reshape(-1).cpu().long()
+                        source_positions = old_by_id[sample_id]["hidden_positions"].reshape(-1).cpu().long()
+                        for row in detailed["rows"]:
+                            row["sample_id"] = sample_id
+                            pos = int(row["absolute_position"])
+                            matched = torch.nonzero(source_positions == pos).reshape(-1)
+                            if matched.numel() != 1:
+                                raise ValueError("Directional diagnostic prefix position is ambiguous")
+                            end = int(stored_by_id[sample_id]["_verl_feature_start"]) + int(matched[0]) + 1
+                            row["prefix_sha256"] = hashlib.sha256(
+                                source_ids[:end].numpy().tobytes()
+                            ).hexdigest()
+                            row["window_start"] = int(stored_by_id[sample_id]["_verl_feature_start"])
+                            row["window_end"] = int(stored_by_id[sample_id]["_verl_feature_end"])
+                            row["old_actor_step"] = 0 if int(source_step) == 1 else int(source_step)
+                            row["new_actor_step"] = int(actor_step)
+                            row["feature_actor_step"] = int(actor_step)
+                            row["trace_actor_step"] = 0 if int(source_step) == 1 else int(source_step)
+                        torch.save(detailed, path)
+                        for row in diagnostic_candidates:
+                            if row["sample_id"] == sample_id:
+                                row["selected"] = row["anchor"] in anchors
+                if self.is_drafter_group_leader:
+                    output = diagnostic_root / f"candidates_rank{self.rank:02d}.jsonl"
+                    if output.exists():
+                        raise FileExistsError(output)
+                    with output.open("w", encoding="utf-8") as stream:
+                        for row in diagnostic_candidates:
+                            stream.write(json.dumps(row, sort_keys=True) + "\n")
+            for sample_id, item in stored_by_id.items():
+                item["_speco_directional_selected_anchors"] = selected[sample_id]
+            self.trainer.collected_data = type(self.trainer.collected_data)(
+                (
+                    item for item in self.trainer.collected_data
+                    if int(item.get("step", -1)) != int(actor_step)
+                    or item.get("_speco_directional_selected_anchors")
+                ),
+                maxlen=self.trainer.collected_data.maxlen,
+            )
+            selected_samples = sum(bool(anchors) for anchors in selected.values())
+            selected_anchors = sum(len(anchors) for anchors in selected.values())
+            if selected_samples == 0:
+                await self.trainer.cleanup_training(clear_data=True)
+            return {
+                "candidate_samples": len(stored_by_id),
+                "candidate_anchors": len(candidates),
+                "selected_samples": selected_samples,
+                "selected_anchors": selected_anchors,
+                "m_mean": sum(row[2] for row in candidates) / max(len(candidates), 1),
+                "tv_mean": sum(row[3] for row in candidates) / max(len(candidates), 1),
+                "old_actor_step": int(source_step) - 1 if int(source_step) == 1 else int(source_step),
+                "new_actor_step": int(actor_step),
+            }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
@@ -1064,7 +1259,7 @@ class SpecoWorker(Worker):
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def train_drafter(self):
+    async def train_drafter(self, learning_rate=None):
         result = {
             "trained": False,
             "triggered": False,
@@ -1126,6 +1321,16 @@ class SpecoWorker(Worker):
                         self.last_global_step
                     )
                     result["candidate_baseline_cached"] = int(candidate_ready)
+                if learning_rate is not None:
+                    from verl_speco.trainer.entropy_lr import set_cycle_lr
+
+                    cfg = self.config.rollout.drafter.training
+                    if not cfg.get("entropy_lr_enabled", False) or cfg.get("lr_scheduler_type") != "constant" or int(cfg.get("lr_warmup_steps", 0)) != 0:
+                        raise ValueError("Entropy LR requires enabled control and a constant scheduler without warmup")
+                    if not float(cfg.get("entropy_lr_min", 5e-6)) <= float(learning_rate) <= float(cfg.get("entropy_lr_max", 1.5e-5)):
+                        raise ValueError("Requested drafter LR is outside configured bounds")
+                    set_cycle_lr(self.trainer.optimizer, self.trainer.lr_scheduler, learning_rate)
+                    result["drafter/entropy_lr/applied_lr"] = float(learning_rate)
                 for _ in range(self.train_steps_per_trigger):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)

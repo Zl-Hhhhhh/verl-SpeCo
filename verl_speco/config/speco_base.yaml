@@ -150,6 +150,11 @@ actor_rollout_ref:
         # Prefer samples not yet consumed in the current collection cycle.
         train_unique_samples_first: false
         lr: 1e-5
+        # Optional bounded certainty LR with same-actor paired candidate validation.
+        entropy_lr_enabled: false
+        entropy_lr_min: 5e-6
+        entropy_lr_max: 1.5e-5
+        entropy_lr_ema_beta: 0.3
         lr_warmup_steps: 0
         lr_scheduler_type: constant
         lr_decay_steps: 100
@@ -183,6 +188,16 @@ actor_rollout_ref:
         dflash_ce_token_chunk_size: 64
         dspark_block_size: 7
         dspark_num_anchors: 32
+        # Reserve part of the existing anchor budget for reached first rejections
+        # with low actor entropy. Zero preserves deterministic uniform sampling.
+        dspark_low_entropy_anchor_fraction: 0.0
+        dspark_low_entropy_threshold: 0.01
+        dspark_position_entropy_stratified_sampling_enabled: false
+        dspark_low_entropy_max_rejected_logprob: -4.0
+        # Zero disables the stage gate; otherwise require consecutive collection
+        # cycles above the reached-token low-entropy share before prioritizing.
+        dspark_certainty_share_threshold: 0.0
+        dspark_certainty_patience: 2
         # Draft-OPD response tokens are not position-decayed; rejected suffixes
         # use their own decay below.
         dspark_loss_decay_gamma: 0.0
@@ -222,11 +237,18 @@ actor_rollout_ref:
         # Adds alpha * global_mean_first_rejection_CE, without K3 clamps.
         # Requires trace-aligned anchors; zero preserves the existing objective.
         dspark_first_rejection_ce_alpha: 0.0
+        dspark_first_rejection_ce_low_entropy_multiplier: 1.0
+        dspark_first_rejection_ce_low_entropy_threshold: 0.01
+        dspark_first_rejection_ce_max_rejected_logprob: -4.0
         dspark_l1_loss_alpha: 0.0
         dspark_trace_aligned_anchors: false
         dspark_accepted_k3_alpha: 1.0
         dspark_accepted_fkl_alpha: 0.0
         dspark_rejected_k3_alpha: 1.0
+        # Optional separately normalized rejected-K3 auxiliary. A positive
+        # value requires a positive prefix length measured from first rejection.
+        dspark_rejected_aux_alpha: 0.0
+        dspark_rejected_prefix_length: 0
         # Independent objective selectors. Existing *_k3_alpha coefficients
         # multiply the selected objective; stream weighting/decay are unchanged.
         # Response uses current-student support; rejected uses verified rollout

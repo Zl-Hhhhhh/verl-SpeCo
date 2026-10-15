@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextvars
 import inspect
 import logging
+import os
 import types
 from functools import wraps
 from typing import Any, cast
@@ -25,6 +26,7 @@ from typing import Any, cast
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
+_SAMPLING_AUDIT_RECORDED = False
 _DEFAULT_EXTRA_KEYS = {
     "turn_scores",
     "tool_rewards",
@@ -130,6 +132,15 @@ def _sampling_params_with_speco_step(
         patched["_verl_skip_drafter_collection"] = True
     if max_tokens is not None:
         patched["max_tokens"] = int(max_tokens)
+    global _SAMPLING_AUDIT_RECORDED
+    if validate and not _SAMPLING_AUDIT_RECORDED and os.getenv(
+        "SPECO_AUDIT_SAMPLING_PARAMS", ""
+    ).lower() in ("1", "true", "yes", "on"):
+        print("[speco agent sampling audit]", {
+            key: patched.get(key)
+            for key in ("temperature", "top_p", "top_k", "seed", "max_tokens")
+        }, flush=True)
+        _SAMPLING_AUDIT_RECORDED = True
     return patched
 
 
@@ -388,8 +399,6 @@ def _build_speco_agent_loop_worker_class(worker_cls):
 
 
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
-    if not _is_sglang_rollout_config(getattr(manager, "config", None)):
-        return
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
 
@@ -398,6 +407,12 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     manager.agent_loop_workers_class = ray.remote(
         _build_speco_agent_loop_worker_class(worker_cls)
     )
+
+    # A module-level monkeypatch is lost when Ray imports the upstream worker
+    # in a fresh process. Carry the explicit bridge for vLLM as well as SGLang.
+    if not _is_sglang_rollout_config(getattr(manager, "config", None)):
+        manager._speco_agent_loop_manager_configured = True
+        return
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server

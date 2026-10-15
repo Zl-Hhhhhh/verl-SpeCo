@@ -168,6 +168,24 @@ def test_disabled_auxiliary_loss_does_not_reduce(monkeypatch):
     assert all(v.item() == 0 for v in trainer._reduce_auxiliary_loss({"total_local_ploss": torch.tensor(3.)}))
 
 
+def test_multiple_auxiliary_losses_keep_independent_denominators():
+    trainer = _bare_trainer()
+    first = torch.tensor(2.0, requires_grad=True)
+    second = torch.tensor(6.0, requires_grad=True)
+    metric, backward, count = trainer._reduce_auxiliary_losses({
+        "total_local_ploss": torch.tensor(0.0),
+        "auxiliary_losses": [
+            {"loss_sum": first, "token_count": torch.tensor(2.0)},
+            {"loss_sum": second, "token_count": torch.tensor(3.0)},
+        ],
+    })
+    assert metric.item() == pytest.approx(3.0)
+    assert count.item() == pytest.approx(5.0)
+    backward.backward()
+    assert first.grad.item() == pytest.approx(0.5)
+    assert second.grad.item() == pytest.approx(1 / 3)
+
+
 def test_optimizer_step_includes_separately_normalized_auxiliary_gradient(monkeypatch):
     trainer = _bare_trainer()
     trainer.model = torch.nn.Linear(1, 1, bias=False)

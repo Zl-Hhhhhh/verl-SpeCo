@@ -43,6 +43,7 @@ _NPU_CHECKPOINT_LOAD_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
+_NPU_OPTIMIZER_OFFLOAD_APPLIED = False
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -377,6 +378,62 @@ def install_verl_fsdp_training_output_release_compat(
     return True
 
 
+def install_verl_npu_optimizer_offload_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Use pageable host memory for NPU optimizer offload.
+
+    verl's asynchronous device-to-CPU copy asks the Ascend runtime for pinned
+    host memory for every optimizer-state tensor. With many actor ranks doing
+    this concurrently, the driver can reject a single allocation even when
+    ordinary system memory is plentiful. A blocking copy preserves the tensor
+    values and placement without consuming that pinned-memory pool.
+    """
+
+    global _NPU_OPTIMIZER_OFFLOAD_APPLIED
+    if _NPU_OPTIMIZER_OFFLOAD_APPLIED or not _module_available("torch_npu"):
+        return False
+
+    device_module = module_importer("verl.utils.device")
+    if device_module.get_device_name() != "npu":
+        return False
+
+    fsdp_utils_module = module_importer("verl.utils.fsdp_utils")
+    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
+    original_offload = getattr(fsdp_utils_module, "offload_fsdp_optimizer", None)
+    if original_offload is None:
+        return False
+    if getattr(original_offload, "_speco_npu_sync_optimizer_offload", False):
+        _NPU_OPTIMIZER_OFFLOAD_APPLIED = True
+        return False
+
+    torch_module = fsdp_utils_module.torch
+
+    @torch_module.no_grad()
+    def offload_fsdp_optimizer_sync(optimizer):
+        if not optimizer.state:
+            return
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                state = optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch_module.Tensor):
+                        state[key] = value.to("cpu", non_blocking=False)
+
+    setattr(
+        offload_fsdp_optimizer_sync,
+        "_speco_npu_sync_optimizer_offload",
+        True,
+    )
+    # transformer_impl imports this symbol directly, so update both the source
+    # module and the already-bound engine global.
+    fsdp_utils_module.offload_fsdp_optimizer = offload_fsdp_optimizer_sync
+    engine_module.offload_fsdp_optimizer = offload_fsdp_optimizer_sync
+    _NPU_OPTIMIZER_OFFLOAD_APPLIED = True
+    logger.warning("Enabled synchronous NPU optimizer offload to pageable CPU memory")
+    return True
+
+
 def install_verl_npu_fsdp2_weight_export_compat(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
@@ -496,6 +553,7 @@ class VerlNPUVLLMImportCompatMixin:
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
+        install_verl_npu_optimizer_offload_compat()
         install_verl_npu_checkpoint_load_compat()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()

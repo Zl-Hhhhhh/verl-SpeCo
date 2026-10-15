@@ -67,6 +67,7 @@ SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
 SPECO_VLLM_TRACE_SPOOL_DIR_ENV = "VERL_SPECO_VLLM_TRACE_SPOOL_DIR"
 SPECO_VLLM_TRACE_SPOOL_DIR_DEFAULT = "/dev/shm/verl_speco_vllm_traces"
 SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
+SPECO_VLLM_VERIFY_ENTROPY_ENV = "SPECO_VLLM_VERIFY_ENTROPY"
 SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
 SPECO_VLLM_ENGINE_STARTUP_LOCK_ENV = "VERL_SPECO_VLLM_ENGINE_STARTUP_LOCK"
 SPECO_VLLM_ENGINE_STARTUP_LOCK_DEFAULT = (
@@ -2130,8 +2131,10 @@ def _record_vllm_spec_decode_acceptance(
     scheduler._speco_spec_decode_log_accepted = 0
 
 
-def _compute_vllm_draft_teacher_logprobs(logits: Any, metadata: Any) -> Any:
-    """Gather raw target-model log-probabilities for flattened draft tokens."""
+def _compute_vllm_draft_teacher_statistics(
+    logits: Any, metadata: Any, *, calculate_entropy: bool = False
+) -> tuple[Any, Any]:
+    """Gather raw actor draft log-probs and optionally full-vocabulary entropy."""
 
     import torch
 
@@ -2142,7 +2145,31 @@ def _compute_vllm_draft_teacher_logprobs(logits: Any, metadata: Any) -> Any:
             "vLLM verify logits and flattened draft token counts do not match"
         )
     selected_logits = target_logits.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
-    return selected_logits - torch.logsumexp(target_logits, dim=-1)
+    logprobs = selected_logits - torch.logsumexp(target_logits, dim=-1)
+    if not calculate_entropy:
+        return logprobs, None
+    # Chunk the full-vocabulary reduction to bound temporary device memory.
+    entropies = []
+    for chunk in target_logits.split(32, dim=0):
+        log_partition = torch.logsumexp(chunk, dim=-1, keepdim=True)
+        log_probabilities = chunk - log_partition
+        probabilities = torch.exp(log_probabilities)
+        # Masked vocabulary logits are -inf; 0 * -inf would yield NaN.
+        finite_log_probabilities = torch.where(
+            torch.isfinite(log_probabilities),
+            log_probabilities,
+            torch.zeros_like(log_probabilities),
+        )
+        entropies.append(
+            (-(probabilities * finite_log_probabilities).sum(-1)).clamp_min(0)
+        )
+    return logprobs, torch.cat(entropies)
+
+
+def _compute_vllm_draft_teacher_logprobs(logits: Any, metadata: Any) -> Any:
+    """Gather raw target-model log-probabilities for flattened draft tokens."""
+
+    return _compute_vllm_draft_teacher_statistics(logits, metadata)[0]
 
 
 def _build_vllm_speculative_trace_events(
@@ -2166,6 +2193,11 @@ def _build_vllm_speculative_trace_events(
         verified_teacher_logprobs = getattr(
             model_runner_output,
             "_speco_verified_draft_teacher_logprobs_by_request",
+            None,
+        )
+        verified_teacher_entropies = getattr(
+            model_runner_output,
+            "_speco_verified_draft_teacher_entropies_by_request",
             None,
         )
         if isinstance(verified_drafts, dict):
@@ -2207,6 +2239,15 @@ def _build_vllm_speculative_trace_events(
                     ][: len(draft_ids)]
                 except (TypeError, ValueError):
                     draft_teacher_logprobs = []
+        draft_teacher_entropies: list[float] = []
+        if isinstance(verified_teacher_entropies, dict):
+            raw_entropies = verified_teacher_entropies.get(
+                request_id, verified_teacher_entropies.get(str(request_id))
+            )
+            if isinstance(raw_entropies, (list, tuple)):
+                draft_teacher_entropies = [
+                    float(value) for value in raw_entropies[: len(draft_ids)]
+                ]
         num_sampled = max(
             _int_or_zero(getattr(scheduler, "num_sampled_tokens_per_step", 1)), 0
         )
@@ -2244,6 +2285,8 @@ def _build_vllm_speculative_trace_events(
                 ),
             }
         ]
+        if draft_teacher_entropies:
+            traces[str(request_id)][0]["draft_teacher_entropies"] = draft_teacher_entropies
         topk_by_request = getattr(model_runner_output, "_speco_verified_draft_topk_by_request", {})
         topk_payload = topk_by_request.get(str(request_id))
         if topk_payload is not None:
@@ -2918,14 +2961,18 @@ def patch_vllm_ascend_verified_draft_capture() -> bool:
         if logits is not None and spec_decode_metadata is not None:
             try:
                 draft_ids = spec_decode_metadata.draft_token_ids.long().reshape(-1)
-                teacher_logprobs = _compute_vllm_draft_teacher_logprobs(
-                    logits, spec_decode_metadata
+                teacher_logprobs, teacher_entropies = _compute_vllm_draft_teacher_statistics(
+                    logits, spec_decode_metadata,
+                    calculate_entropy=bool(
+                        _bool_or_none(os.getenv(SPECO_VLLM_VERIFY_ENTROPY_ENV))
+                    ),
                 )
                 self._speco_verified_draft_teacher_payload = (
                     self.input_batch.req_ids.copy(),
                     list(spec_decode_metadata.num_draft_tokens),
                     draft_ids.detach(),
                     teacher_logprobs.detach(),
+                    teacher_entropies.detach() if teacher_entropies is not None else None,
                 )
             except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
                 self._speco_verified_draft_teacher_payload = None
@@ -2934,6 +2981,7 @@ def patch_vllm_ascend_verified_draft_capture() -> bool:
     def sample_tokens_with_speco_verified_drafts(self, *args, **kwargs):
         verified_drafts: dict[str, list[int]] = {}
         verified_teacher_logprobs: dict[str, list[float]] = {}
+        verified_teacher_entropies: dict[str, list[float]] = {}
         if getattr(self, "_draft_token_ids", None) is not None:
             try:
                 draft_token_ids, request_ids = self._get_draft_token_ids_cpu()
@@ -2945,14 +2993,18 @@ def patch_vllm_ascend_verified_draft_capture() -> bool:
                 verified_drafts = {}
         result = original_sample(self, *args, **kwargs)
         payload = getattr(self, "_speco_verified_draft_teacher_payload", None)
-        if isinstance(payload, tuple) and len(payload) == 4:
+        if isinstance(payload, tuple) and len(payload) == 5:
             try:
-                request_ids, draft_counts, draft_ids_tensor, teacher_logprobs_tensor = (
+                request_ids, draft_counts, draft_ids_tensor, teacher_logprobs_tensor, teacher_entropies_tensor = (
                     payload
                 )
                 flat_draft_ids = draft_ids_tensor.detach().cpu().tolist()
                 flat_teacher_logprobs = (
                     teacher_logprobs_tensor.detach().float().cpu().tolist()
+                )
+                flat_teacher_entropies = (
+                    teacher_entropies_tensor.detach().float().cpu().tolist()
+                    if teacher_entropies_tensor is not None else None
                 )
                 offset = 0
                 for request_id, raw_count in zip(request_ids, draft_counts):
@@ -2967,6 +3019,10 @@ def patch_vllm_ascend_verified_draft_capture() -> bool:
                     verified_teacher_logprobs[request_key] = [
                         float(value) for value in flat_teacher_logprobs[offset:end]
                     ]
+                    if flat_teacher_entropies is not None:
+                        verified_teacher_entropies[request_key] = [
+                            float(value) for value in flat_teacher_entropies[offset:end]
+                        ]
                     offset = end
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 verified_teacher_logprobs = {}
@@ -2980,6 +3036,9 @@ def patch_vllm_ascend_verified_draft_capture() -> bool:
             )
             model_runner_output._speco_verified_draft_teacher_logprobs_by_request = (
                 verified_teacher_logprobs
+            )
+            model_runner_output._speco_verified_draft_teacher_entropies_by_request = (
+                verified_teacher_entropies
             )
         return result
 
@@ -3397,6 +3456,27 @@ class _SpecoVLLMHttpServerMixin:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
     async def generate(self, *args, **kwargs):
+        # AgentLoop's SPECO bridge adds side-channel routing metadata. These
+        # are not vLLM SamplingParams fields. Keep ordinary controls (including
+        # max_tokens) intact, and never mutate the caller's reusable dictionary.
+        if "sampling_params" in kwargs:
+            kwargs["sampling_params"] = {
+                key: value for key, value in kwargs["sampling_params"].items()
+                if not key.startswith("_verl_")
+            }
+        elif len(args) >= 2:
+            args = (args[0], {
+                key: value for key, value in args[1].items()
+                if not key.startswith("_verl_")
+            }, *args[2:])
+        if os.getenv("SPECO_AUDIT_SAMPLING_PARAMS", "").lower() in ("1", "true", "yes", "on"):
+            if not getattr(self, "_speco_sampling_params_audited", False):
+                params = kwargs.get("sampling_params", args[1] if len(args) >= 2 else {})
+                print("[speco sampling audit]", {
+                    key: params.get(key)
+                    for key in ("temperature", "top_p", "top_k", "seed", "max_tokens")
+                }, flush=True)
+                self._speco_sampling_params_audited = True
         request_id = kwargs.get("request_id")
         if request_id is None and len(args) >= 3:
             request_id = args[2]

@@ -10,7 +10,7 @@ set -euo pipefail
 # Important paths: MODEL_PATH, DRAFTER_PATH, TRAIN_FILE, TEST_FILE.
 # Dataset selection: DATASET_PROFILE=dapo|taco_taco|taco_lcb|taco_lcb_full|wildsci_gpqa|wildsci_mmlu.
 # Code profiles default to 2048 prompt / 4096 response; set SANDBOX_FUSION_URL for isolated execution.
-# wildsci_gpqa defaults to 4096 / 2048 and validation every 10 steps; wildsci_mmlu uses
+# wildsci_gpqa defaults to 3072 prompt / 4096 response and validation every 10 steps; wildsci_mmlu uses
 # 2048 / 2048 and every 50 steps. Use taco_lcb_full with trainer.val_only=True for final evaluation.
 # MAX_PROMPT_LENGTH, MAX_RESPONSE_LENGTH, TEST_FREQ, TRAIN_FILE, and TEST_FILE override the profile.
 # BigCodeBench remains an external official-harness evaluation and is not supported as TEST_FILE here.

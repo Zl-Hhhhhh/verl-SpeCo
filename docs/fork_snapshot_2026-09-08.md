@@ -1,5 +1,7 @@
 # Local DSpark experiment snapshot — 2026-09-08
 
+> Historical record: the half-node and P4 wrapper scripts were removed on 2026-09-09. Use `tools/run_dspark_vllm_experiment.sh` with explicit device, dataset and attention settings for new runs; wrapper commands below describe the original experiments.
+
 This branch preserves the code, configurations, tests, launch tools, and notes
 used for the local P0–P4 experiments, including the running P4_03 configuration.
 It is a snapshot of the working files based on upstream commit `f452ac8`.

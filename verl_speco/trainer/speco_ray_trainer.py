@@ -14,6 +14,7 @@
 """SPECO adapter for verl v0.8.0 RayPPOTrainer."""
 
 import hashlib
+import gzip
 import json
 import logging
 import math
@@ -79,6 +80,10 @@ from verl_speco.integration.vllm_runtime import (
 )
 from verl_speco.trainer.dspark_training_config import (
     dspark_target_distribution_loss_enabled,
+)
+from verl_speco.trainer.verification_entropy import (
+    accumulate_verification_entropy,
+    verification_entropy_metrics,
 )
 from verl_speco.workers import SpecoWorker
 
@@ -528,6 +533,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
+        self._speco_directional_panel = None
+        self._speco_directional_next_panel = None
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -543,6 +550,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_collect_rollout_features(self, samples: list[list[dict]]):
         return self._require_speco_worker_group().collect_rollout_features(samples)
 
+    def speco_collect_directional_pair(self, old_buckets, new_buckets, old_head, source_step, actor_step):
+        return self._require_speco_worker_group().collect_directional_pair(
+            old_buckets, new_buckets, old_head, source_step, actor_step
+        )
+
     def speco_sync_target_lm_head_weight(self, payload: Any, global_step: Any = None):
         return self._require_speco_worker_group().sync_target_lm_head_weight(
             payload, global_step=global_step
@@ -553,8 +565,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._require_speco_worker_group().get_drafter_target_lm_head_row_indices()
         )
 
-    def speco_train_drafter(self):
-        return self._require_speco_worker_group().train_drafter()
+    def speco_train_drafter(self, learning_rate=None):
+        if learning_rate is None:
+            return self._require_speco_worker_group().train_drafter()
+        return self._require_speco_worker_group().train_drafter(learning_rate=learning_rate)
+
+    def _speco_entropy_lr_enabled(self):
+        return bool(self._speco_drafter_training_config().get("entropy_lr_enabled", False))
+
+    def _speco_entropy_lr(self):
+        if not hasattr(self, "_entropy_lr_runtime"):
+            from verl_speco.trainer.entropy_lr_runtime import EntropyLRRuntime
+
+            self._entropy_lr_runtime = EntropyLRRuntime(self)
+        return self._entropy_lr_runtime
 
     def speco_activate_drafter_training_model(self):
         return self._require_speco_worker_group().activate_drafter_training_model()
@@ -590,12 +614,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
         online_drafter_enabled = self.is_drafter_training_enabled(self.config)
+        frozen_compare_enabled = bool(
+            self._speco_drafter_training_config().get("frozen_drafter_compare_output")
+        )
         if online_drafter_enabled:
             self._speco_prepare_drafter_checkpoint_for_worker_init()
         if drafter_rollout_enabled:
             configure_sglang_runtime_from_config(self.config)
             configure_vllm_runtime_from_config(self.config)
-            if online_drafter_enabled:
+            if online_drafter_enabled or frozen_compare_enabled:
                 install_agent_loop_runtime_patch()
             if (
                 _get_nested(self.config, ("actor_rollout_ref", "rollout", "name"), None)
@@ -607,7 +634,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if should_install_sglang_base_compat_runtime(self.config):
                 install_upstream_sglang_runtime_bridge(base_compat_only=True)
         with self._hide_speco_drafter_config_from_upstream_rollout():
-            with self._use_speco_agent_loop_manager(online_drafter_enabled):
+            with self._use_speco_agent_loop_manager(online_drafter_enabled or frozen_compare_enabled):
                 super().init_workers()
         if online_drafter_enabled:
             self._init_speco_drafter_workers()
@@ -981,6 +1008,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._pending_drafter_checkpoint_refs.append(checkpoint_refs)
         return checkpoint_refs
 
+    def _speco_terminal_checkpoint_step(self) -> int:
+        # VERL increments global_steps after logging the final completed step.
+        # Do not label those same weights as a nonexistent extra training step.
+        step = int(self.global_steps)
+        limit = getattr(self, "total_training_steps", None)
+        return min(step, int(limit)) if limit is not None and int(limit) > 0 else step
+
     def _speco_mark_final_drafter_checkpoint(self) -> str | None:
         if not self._speco_should_save_drafter_checkpoint():
             return None
@@ -993,7 +1027,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         temporary_path = f"{marker_path}.tmp.{os.getpid()}"
         with open(temporary_path, "w", encoding="utf-8") as stream:
-            stream.write(f"{int(self.global_steps)}\n")
+            stream.write(f"{self._speco_terminal_checkpoint_step()}\n")
         os.replace(temporary_path, marker_path)
         return marker_path
 
@@ -1017,8 +1051,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_should_collect_drafter_this_step(self) -> bool:
         training_cfg = self._speco_drafter_training_config()
+        if bool(training_cfg.get("dspark_directional_sampling_enabled", False)):
+            return int(self.global_steps) == 1
         return speco_step_matches_interval(
             self.global_steps, training_cfg.get("collect_interval_steps", 1)
+        )
+
+    def _speco_directional_enabled(self) -> bool:
+        return bool(
+            self._speco_drafter_training_config().get(
+                "dspark_directional_sampling_enabled", False
+            )
         )
 
     def _speco_should_train_drafter_this_step(self) -> bool:
@@ -1521,13 +1564,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return f"{external_id or 'anonymous'}:{prompt_digest}"
 
     def _speco_build_oldlogprob_collect_plan(
-        self, batch: DataProto
+        self, batch: DataProto, *, force: bool = False
     ) -> dict[str, Any] | None:
         if not self._speco_oldlogprob_collection_enabled():
             return None
-        if not self._speco_should_collect_drafter_this_step():
+        if not force and not self._speco_should_collect_drafter_this_step():
             return None
-        if not self._speco_should_train_drafter_this_step():
+        if not force and not self._speco_should_train_drafter_this_step() and not self._speco_directional_enabled():
             return None
         training_cfg = self._speco_drafter_training_config()
         sample_rate = float(training_cfg.get("collection_sample_rate", 1.0) or 0.0)
@@ -1850,7 +1893,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         batch: DataProto,
         collect_plan: dict[str, Any] | None,
         output: Any,
-    ) -> int:
+        *,
+        stage_only: bool = False,
+    ) -> int | list[list[dict]]:
         if not collect_plan:
             return 0
         hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
@@ -1908,6 +1953,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         speculative_trace_diagnostics = non_tensor_batch.get(
             SPECO_VLLM_SPECULATIVE_TRACE_DIAGNOSTICS_KEY
         )
+        entropy_sampling_active = True
+        training_cfg = self._speco_drafter_training_config()
+        if self._speco_entropy_lr_enabled():
+            self._speco_entropy_lr().observe(
+                speculative_traces if speculative_traces is not None else [], self.global_steps
+            )
+        certainty_threshold = float(training_cfg.get("dspark_certainty_share_threshold", 0.0))
+        if certainty_threshold > 0:
+            from verl_speco.trainer.entropy_sampling import update_certainty_gate
+
+            gate = update_certainty_gate(
+                speculative_traces if speculative_traces is not None else [],
+                entropy_threshold=float(training_cfg.get("dspark_low_entropy_threshold", 0.01)),
+                share_threshold=certainty_threshold,
+                patience=int(training_cfg.get("dspark_certainty_patience", 2)),
+                streak=getattr(self, "_speco_certainty_streak", 0),
+            )
+            self._speco_certainty_streak = gate["streak"]
+            entropy_sampling_active = bool(gate["active"])
+            self._speco_certainty_metrics = {
+                f"drafter/certainty/{key}": value for key, value in gate.items()
+            }
+            self._speco_certainty_metrics["drafter/certainty/measurement_step"] = self.global_steps
+            logger.info("[dspark certainty gate] step=%s stats=%s", self.global_steps, gate)
         buckets: list[list[dict[str, Any]]] = [
             [] for _ in range(int(collect_plan["owner_count"]))
         ]
@@ -2043,6 +2112,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "hidden_position_end": int(valid_positions[-1].item()) + 1,
                 "global_step": self.global_steps,
                 "replica_rank": owner,
+                "low_entropy_sampling_active": entropy_sampling_active,
             }
             if batch_idx < len(sample_ids) and sample_ids[batch_idx] is not None:
                 sample["sample_id"] = str(sample_ids[batch_idx])
@@ -2137,12 +2207,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     planned_drop_reasons.get(key, 0)
                 ) + int(value)
             self._speco_last_oldlogprob_drop_reasons = planned_drop_reasons
-            return 0
+            return [] if stage_only else 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
         if dispatch_bucket_count is not None and dispatch_bucket_count > len(buckets):
             buckets.extend([[] for _ in range(dispatch_bucket_count - len(buckets))])
-        self._speco_set_drafter_global_step(log_timing=False)
-        self._speco_collect_rollout_features_rpc("oldlogprob", buckets)
+        if not stage_only:
+            self._speco_set_drafter_global_step(log_timing=False)
+            self._speco_collect_rollout_features_rpc("oldlogprob", buckets)
         self._speco_last_collected_samples = collected
         self._speco_last_oldlogprob_collected_samples = collected
         self._speco_last_oldlogprob_collected_rows = collected_rows
@@ -2180,7 +2251,169 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "all_accepted_steps": fixed_trace_all_accepted_steps,
             "actor_snapshot_step": int(self.global_steps),
         }
-        return collected
+        return buckets if stage_only else collected
+
+    @staticmethod
+    def _speco_directional_compact_panel(batch: DataProto, plan: dict[str, Any]):
+        indices = torch.nonzero(plan["collect_mask"], as_tuple=False).reshape(-1)
+        if indices.numel() <= 0:
+            raise ValueError("Directional collection has no candidate responses")
+        compact_batch = batch.select_idxs(indices)
+        selected = indices.tolist()
+        compact_plan = dict(plan)
+        for key in (
+            "collect_mask", "hidden_positions", "hidden_position_mask", "owner_rank"
+        ):
+            compact_plan[key] = plan[key].index_select(0, indices)
+        for key in (
+            "prompt_lens", "response_lens", "window_strata", "sample_ids",
+            "fixed_eval_cohort",
+        ):
+            compact_plan[key] = [plan[key][index] for index in selected]
+        compact_plan["selected_count"] = len(selected)
+        return compact_batch, compact_plan
+
+    def _speco_directional_actor_head(self):
+        get_head = self._speco_actor_rollout_method("get_actor_lm_head_weight")
+        payload = self._first_non_null(self._ray_get_if_needed(get_head(None)) or [])
+        if not isinstance(payload, dict) or not torch.is_tensor(payload.get("weight")):
+            raise RuntimeError("Directional collection could not capture actor output head")
+        if payload.get("row_indices") is not None:
+            raise RuntimeError("Directional collection requires the full actor output head")
+        return payload
+
+    @staticmethod
+    def _speco_directional_verify_panel(buckets, head, expected_samples, source_step, actor_step):
+        samples = [sample for bucket in buckets for sample in bucket]
+        sample_ids = [str(sample.get("sample_id", "")) for sample in samples]
+        if len(samples) != expected_samples or not all(sample_ids) or len(set(sample_ids)) != len(samples):
+            raise RuntimeError("Directional prefix panel is incomplete or has duplicate sample IDs")
+        if not isinstance(head, dict) or not torch.is_tensor(head.get("weight")) or head["weight"].ndim != 2:
+            raise RuntimeError("Directional prefix panel has no full actor output head")
+        if head.get("row_indices") is not None:
+            raise RuntimeError("Directional prefix panel has a restricted actor output head")
+        for sample in samples:
+            positions = sample.get("hidden_positions")
+            has_hidden = any(sample.get(key) is not None for key in (
+                "hidden_states", "hidden_states_ref", "hidden_states_ref_chunks"
+            ))
+            if (int(sample.get("global_step", -1)) != source_step
+                    or not torch.is_tensor(positions) or positions.numel() == 0
+                    or not has_hidden):
+                raise RuntimeError("Directional prefix panel is missing paired actor features")
+        logger.warning(
+            "[directional panel saved] source_step=%s actor_step=%s samples=%s "
+            "hidden_rows=%s head_shape=%s",
+            source_step, actor_step, len(samples),
+            sum(int(sample["hidden_positions"].numel()) for sample in samples),
+            tuple(head["weight"].shape),
+        )
+
+    def _speco_directional_capture_panel(self, panel):
+        batch, plan = panel
+        model_batch = _select_policy_model_batch(batch)
+        batch_td = left_right_2_no_padding(model_batch.to_tensordict())
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=self._speco_oldlogprob_calculate_entropy(),
+            compute_loss=False,
+        )
+        batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = plan["collect_mask"]
+        batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = plan["hidden_positions"]
+        batch_td[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = plan["hidden_position_mask"]
+        batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = plan["owner_rank"]
+        tu.assign_non_tensor_data(
+            batch_td, OLD_LOGPROB_AUX_LAYER_IDS_KEY,
+            self._speco_oldlogprob_aux_layer_ids(),
+        )
+        tu.assign_non_tensor_data(
+            batch_td, OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
+            self._speco_oldlogprob_hidden_capture_impl(),
+        )
+        tu.assign_non_tensor_data(
+            batch_td, OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+            self._speco_oldlogprob_hidden_layout(),
+        )
+        tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        buckets = self._speco_collect_oldlogprob_features(
+            batch, plan, output, stage_only=True
+        )
+        if not buckets or sum(len(bucket) for bucket in buckets) != plan["selected_count"]:
+            raise RuntimeError("Directional actor feature capture lost candidate samples")
+        return buckets
+
+    def _speco_directional_finish_pair(self):
+        panel = self._speco_directional_panel
+        if not isinstance(panel, dict):
+            raise RuntimeError("Directional update has no old-actor prefix panel")
+        source_step = int(panel["source_step"])
+        source_actor_step = int(panel["source_actor_step"])
+        interval = int(self._speco_drafter_training_config().get("training_interval_steps", 5))
+        if source_actor_step != int(self.global_steps) - interval:
+            raise RuntimeError("Directional actor references do not span one training cycle")
+        new_buckets = self._speco_directional_capture_panel(panel["data"])
+        self._speco_set_drafter_global_step()
+        head_metrics = self._speco_sync_target_lm_head_weight()
+        if not head_metrics.get("drafter/target_lm_head_synced"):
+            raise RuntimeError("Directional new actor output head was not synchronized")
+        result = self._ray_get_if_needed(
+            self.speco_collect_directional_pair(
+                panel["buckets"], new_buckets, panel["head"],
+                source_step, int(self.global_steps),
+            )
+        )
+        worker_results = self._speco_flatten_checkpoint_results(result)
+        candidates = sum(int(row.get("candidate_samples", 0)) for row in worker_results)
+        selected = sum(int(row.get("selected_samples", 0)) for row in worker_results)
+        selected_anchors = sum(int(row.get("selected_anchors", 0)) for row in worker_results)
+        candidate_anchors = sum(int(row.get("candidate_anchors", 0)) for row in worker_results)
+        m_mean = sum(
+            float(row.get("m_mean", 0.0)) * int(row.get("candidate_anchors", 0))
+            for row in worker_results
+        ) / max(candidate_anchors, 1)
+        tv_mean = sum(
+            float(row.get("tv_mean", 0.0)) * int(row.get("candidate_anchors", 0))
+            for row in worker_results
+        ) / max(candidate_anchors, 1)
+        if candidates <= 0 or candidates > int(panel["data"][1]["selected_count"]):
+            raise RuntimeError("Directional scoring returned an invalid candidate count")
+        self._speco_last_collected_samples = selected
+        self._speco_last_oldlogprob_consumed_samples = selected
+        self._speco_directional_panel = None
+        return selected, {
+            **head_metrics,
+            "drafter/directional/old_actor_step": source_actor_step,
+            "drafter/directional/new_actor_step": int(self.global_steps),
+            "drafter/directional/candidate_samples": candidates,
+            "drafter/directional/selected_samples": selected,
+            "drafter/directional/selected_anchors": selected_anchors,
+            "drafter/directional/candidate_anchors": candidate_anchors,
+            "drafter/directional/m_mean": m_mean,
+            "drafter/directional/current_tv_mean": tv_mean,
+        }
+
+    def _speco_directional_stage_next_panel(self):
+        next_panel = self._speco_directional_next_panel
+        self._speco_directional_next_panel = None
+        if next_panel is None:
+            return
+        total_steps = int(_get_nested(self.config, ("trainer", "total_training_steps"), 0) or 0)
+        if total_steps > 0 and int(self.global_steps) >= total_steps:
+            return
+        buckets = self._speco_directional_capture_panel(next_panel)
+        head = self._speco_directional_actor_head()
+        self._speco_directional_verify_panel(
+            buckets, head, int(next_panel[1]["selected_count"]),
+            int(self.global_steps), int(self.global_steps),
+        )
+        self._speco_directional_panel = {
+            "data": next_panel,
+            "buckets": buckets,
+            "head": head,
+            "source_step": int(self.global_steps),
+            "source_actor_step": int(self.global_steps),
+        }
 
     def _speco_num_rollout_replicas(self, samples: list[dict]) -> int:
         sample_max = (
@@ -2446,7 +2679,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_train_drafter(self) -> tuple[bool, dict[str, Any]]:
         train_rpc_started = time.perf_counter()
-        train_results = self._ray_get_if_needed(self.speco_train_drafter()) or []
+        if self._speco_entropy_lr_enabled():
+            selected_lr = self._speco_entropy_lr().learning_rate(self.global_steps)
+            train_results = self._ray_get_if_needed(self.speco_train_drafter(learning_rate=selected_lr)) or []
+        else:
+            train_results = self._ray_get_if_needed(self.speco_train_drafter()) or []
         train_rpc_elapsed = time.perf_counter() - train_rpc_started
         if not isinstance(train_results, list):
             train_results = [train_results]
@@ -2822,6 +3059,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if not passed:
             self._speco_finalize_candidate(int(self.global_steps), 0.0)
+            if self._speco_entropy_lr_enabled():
+                metrics.update(self._speco_entropy_lr().reject_precheck(reason, train_metrics))
             metrics["drafter/candidate/rejected_pre_publish"] = 1
             logger.warning(
                 "Rejected drafter candidate before rollout: step=%s reason=%s",
@@ -3339,6 +3578,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_rollout_metrics_step = current_step
             self._speco_last_rollout_generation_elapsed_sec = 0.0
             self._speco_last_rollout_response_tokens = 0
+            self._speco_last_rollout_verify_entropy_stats = {}
+        entropy_stats = getattr(self, "_speco_last_rollout_verify_entropy_stats", None)
+        if entropy_stats is None:
+            entropy_stats = self._speco_last_rollout_verify_entropy_stats = {}
+        accumulate_verification_entropy(
+            entropy_stats,
+            (getattr(output, "non_tensor_batch", None) or {}).get(
+                SPECO_VLLM_SPECULATIVE_TRACE_KEY
+            ),
+        )
         self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
             _speco_vllm_spec_decode_stats_from_batch(output),
@@ -3349,6 +3598,66 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_rollout_response_tokens += self._speco_candidate_response_tokens(
             output
         )
+
+    def _speco_save_actor_verify_entropy(self, output: Any) -> None:
+        directory = os.getenv("SPECO_ACTOR_VERIFY_ENTROPY_DIR", "").strip()
+        if not directory:
+            return
+        batch = getattr(output, "batch", None)
+        non_tensor = getattr(output, "non_tensor_batch", {}) or {}
+        traces = non_tensor.get(SPECO_VLLM_SPECULATIVE_TRACE_KEY)
+        if batch is None or traces is None:
+            raise RuntimeError("Actor entropy capture enabled but rollout traces are missing")
+        responses = batch.get("responses")
+        prompts = batch.get("prompts")
+        if not torch.is_tensor(responses):
+            raise RuntimeError("Actor entropy capture requires rollout responses")
+        rows = []
+        for index in range(int(responses.size(0))):
+            events = self._speco_sequence_item(traces, index)
+            if events is None:
+                continue
+            prompt_hash = None
+            if torch.is_tensor(prompts):
+                prompt_ids = prompts[index].detach().cpu().tolist()
+                prompt_hash = hashlib.sha256(
+                    json.dumps(prompt_ids, separators=(",", ":")).encode()
+                ).hexdigest()
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                draft_count = int(event.get("draft_count", 0))
+                entropies = event.get("draft_teacher_entropies", [])
+                if len(entropies) != draft_count or not all(
+                    math.isfinite(value) and value >= 0 for value in entropies
+                ):
+                    raise RuntimeError(
+                        "Actor verify entropy is missing or non-finite: "
+                        f"step={self.global_steps} row={index} "
+                        f"expected={draft_count} actual={len(entropies)}"
+                    )
+                rows.append({
+                    "actor_step": int(self.global_steps),
+                    "response_index": index,
+                    "prompt_sha256": prompt_hash,
+                    "response_start": event.get("response_start"),
+                    "draft_count": draft_count,
+                    "accepted_count": int(event.get("accepted_count", 0)),
+                    "draft_teacher_entropies": entropies,
+                    "draft_teacher_logprobs": event.get("draft_teacher_logprobs", []),
+                    "all_drafts_accepted": event.get("all_drafts_accepted"),
+                })
+        if not rows:
+            raise RuntimeError("Actor entropy capture enabled but no verify events were returned")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(
+            directory, f"actor_step_{int(self.global_steps):04d}_{time.time_ns()}.jsonl.gz"
+        )
+        temporary = path + ".tmp"
+        with gzip.open(temporary, "wt", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+        os.replace(temporary, path)
 
     def _speco_store_validation_rollout_metrics(
         self, output: Any, elapsed_sec: float
@@ -3553,9 +3862,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self, "global_steps", None
         ):
             return {}
-        return _speco_vllm_spec_decode_metrics_from_stats(
+        metrics = _speco_vllm_spec_decode_metrics_from_stats(
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
+        metrics.update(verification_entropy_metrics(
+            getattr(self, "_speco_last_rollout_verify_entropy_stats", None) or {}
+        ))
+        return metrics
 
     def _speco_current_step_rollout_quality_metrics(self) -> dict[str, float]:
         if getattr(self, "_speco_last_rollout_metrics_step", None) != getattr(
@@ -3825,8 +4138,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_store_validation_rollout_metrics(
                     gen_batch_output, elapsed_sec
                 )
+                if os.getenv("SPECO_CAPTURE_VALIDATION_VERIFY_ENTROPY", "").lower() in (
+                    "1", "true", "yes", "on"
+                ):
+                    self._speco_save_actor_verify_entropy(gen_batch_output)
             else:
                 self._speco_store_rollout_metrics(gen_batch_output, elapsed_sec)
+                self._speco_save_actor_verify_entropy(gen_batch_output)
             return gen_batch_output
 
         rollout_generation_target.generate_sequences = MethodType(
@@ -3987,6 +4305,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         pending_drafter_publish = {
             "ready": False,
+            "actor_weights_synced": False,
             "drafter_trained": False,
             "actor_output": None,
         }
@@ -4043,6 +4362,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             else:
                 self._speco_store_rollout_metrics(gen_batch_output, rollout_elapsed)
+                self._speco_save_actor_verify_entropy(gen_batch_output)
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:
                     meta_info = getattr(gen_batch_output, "meta_info", None)
@@ -4100,6 +4420,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
             original_batch = batch
+            directional = self._speco_directional_enabled()
 
             def compute_old_log_prob_without_collection():
                 self._speco_last_oldlogprob_prepare_elapsed_sec = (
@@ -4124,12 +4445,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 return old_log_prob, old_log_prob_mfu
 
-            if not collect_interval_matched or not train_interval_matched:
+            if directional and train_interval_matched:
+                next_plan = self._speco_build_oldlogprob_collect_plan(
+                    original_batch, force=True
+                )
+                if next_plan is None:
+                    raise RuntimeError("Directional cycle boundary has no next prefix panel")
+                self._speco_directional_next_panel = (
+                    self._speco_directional_compact_panel(original_batch, next_plan)
+                )
+                return compute_old_log_prob_without_collection()
+
+            if not collect_interval_matched or (not train_interval_matched and not directional):
                 return compute_old_log_prob_without_collection()
 
             collect_plan = self._speco_build_oldlogprob_collect_plan(original_batch)
             if collect_plan is None:
                 return compute_old_log_prob_without_collection()
+            directional_data = (
+                self._speco_directional_compact_panel(original_batch, collect_plan)
+                if directional else None
+            )
             self._speco_export_fixed_eval_snapshot(original_batch, collect_plan)
             batch = _select_policy_model_batch(original_batch)
             batch_td = batch.to_tensordict()
@@ -4172,9 +4508,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 time.perf_counter() - compute_started
             )
             collect_started = time.perf_counter()
-            self._speco_collect_oldlogprob_features(
-                original_batch, collect_plan, output
+            collected = self._speco_collect_oldlogprob_features(
+                original_batch, collect_plan, output, stage_only=directional
             )
+            if directional:
+                if not collected or directional_data is None:
+                    raise RuntimeError("Initial directional actor panel is empty")
+                head = self._speco_directional_actor_head()
+                self._speco_directional_verify_panel(
+                    collected, head, int(directional_data[1]["selected_count"]),
+                    int(self.global_steps), int(self.global_steps) - 1,
+                )
+                self._speco_directional_panel = {
+                    "data": directional_data,
+                    "buckets": collected,
+                    "head": head,
+                    "source_step": int(self.global_steps),
+                    "source_actor_step": int(self.global_steps) - 1,
+                }
             self._speco_last_oldlogprob_collect_elapsed_sec = (
                 time.perf_counter() - collect_started
             )
@@ -4211,6 +4562,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             update_actor_started = time.perf_counter()
             metrics = dict(self._speco_pending_candidate_metrics)
             metrics.update(getattr(self, "_speco_fixed_eval_export_metrics", {}))
+            metrics.update(getattr(self, "_speco_certainty_metrics", {}))
             self._speco_pending_candidate_metrics = {}
             metrics.update({
                 "drafter/raw_drafter_samples": int(
@@ -4283,7 +4635,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
             })
             metrics.update(self._speco_maybe_save_dual_best_from_rollout())
-            if not self._speco_candidate_gate_enabled():
+            if not self._speco_candidate_gate_enabled() or self._speco_entropy_lr_enabled():
                 metrics.update(self._speco_check_post_update_acceptance_guard())
             collected_samples = int(
                 getattr(self, "_speco_last_oldlogprob_collected_samples", 0)
@@ -4388,8 +4740,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 else 0.0
             )
 
-            train_requested = self._speco_should_attempt_drafter_train_this_step()
+            directional = self._speco_directional_enabled()
+            train_requested = (
+                self._speco_should_train_drafter_this_step()
+                if directional else self._speco_should_attempt_drafter_train_this_step()
+            )
             guard_applicable = (
+                not directional
+                and
                 self._speco_oldlogprob_collection_requested()
                 and bool(getattr(self, "_speco_last_collect_interval_matched", 0))
                 and self._speco_should_train_drafter_this_step()
@@ -4418,7 +4776,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics["drafter/training_guard_reason_id"] = int(
                 guard_reason_ids.get(guard_reason, -1)
             )
-            should_train_drafter = train_requested and guard_passed
+            should_train_drafter = train_requested and guard_passed and not directional
             if train_requested and not guard_passed:
                 message = (
                     "Skipping drafter update because collection integrity guard failed: "
@@ -4444,6 +4802,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             actor_started = time.perf_counter()
             actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
+            if directional and train_requested:
+                selected, pair_metrics = self._speco_directional_finish_pair()
+                metrics.update(pair_metrics)
+                metrics["drafter/collected_samples"] = selected
+                should_train_drafter = selected > 0
             pending_best = self._speco_pending_best_candidate_save
             if isinstance(pending_best, Mapping):
                 self._speco_pending_best_candidate_save = None
@@ -4471,6 +4834,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         drafter_trained, train_metrics
                     )
                 )
+                if self._speco_entropy_lr_enabled() and self._speco_pending_candidate_update is not None:
+                    # Resolve the transaction before upstream checkpoint saving.
+                    # Both probes see this same freshly synchronized actor.
+                    if original_checkpoint_update_weights is None:
+                        raise RuntimeError("Entropy LR validation requires actor weight synchronization")
+                    original_checkpoint_update_weights(self.global_steps)
+                    pending_drafter_publish["actor_weights_synced"] = True
+                    candidate_metrics = self._speco_entropy_lr().validate(original_generate_sequences, train_metrics)
+                    metrics.update(candidate_metrics)
+                    metrics.update(self._speco_arm_post_update_acceptance_guard(candidate_metrics))
             elif defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained
@@ -4482,6 +4855,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_arm_post_update_acceptance_guard(publish_metrics)
                 )
                 metrics.update(self._speco_arm_dual_best_observation(publish_metrics))
+            if directional and train_requested:
+                self._speco_directional_stage_next_panel()
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
@@ -4503,7 +4878,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
-            result = original_checkpoint_update_weights(*args, **kwargs)
+            if pending_drafter_publish["actor_weights_synced"]:
+                pending_drafter_publish["actor_weights_synced"] = False
+                result = None
+            else:
+                result = original_checkpoint_update_weights(*args, **kwargs)
             if (
                 pending_drafter_publish["ready"]
                 and not self._speco_candidate_gate_enabled()
@@ -4582,6 +4961,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         try:
             with self._speco_checkpoint_offset_hook():
                 if self.is_drafter_training_enabled(self.config):
+                    if self._speco_entropy_lr_enabled():
+                        # Check the actual dataset/generation contract before
+                        # spending actor steps on the first candidate update.
+                        self._speco_entropy_lr().prepare_validation_cohort()
                     self._speco_activate_drafter_training_model_before_fit()
                     with (
                         self._speco_tracking_metrics_hook(),
@@ -4590,7 +4973,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         result = super().fit()
                         fit_completed = True
                         return result
-                if self.is_drafter_rollout_enabled(self.config):
+                if self.is_drafter_rollout_enabled(self.config) or os.getenv(
+                    _SPECO_VALIDATION_DIAGNOSTICS_DIR_ENV, ""
+                ).strip():
                     with (
                         self._speco_tracking_metrics_hook(),
                         self._speco_rollout_metrics_fit_hook(),
@@ -4625,12 +5010,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_finalize_candidate(update_step, 0.0)
                 self._speco_pending_candidate_update = None
             self._speco_wait_pending_drafter_checkpoint()
+            terminal_step = self._speco_terminal_checkpoint_step() if fit_completed else None
             if fit_completed and getattr(
                 self, "_speco_last_saved_drafter_step", None
-            ) != int(self.global_steps):
+            ) != terminal_step:
                 # Periodic saves may intentionally be shifted away from publish
                 # steps. Persist the exact terminal drafter state as well.
-                self._speco_save_drafter_checkpoint(wait=True)
+                self._speco_save_drafter_checkpoint(wait=True, step=terminal_step)
             if fit_completed:
                 self._speco_mark_final_drafter_checkpoint()
 
@@ -4702,4 +5088,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _save_checkpoint(self):
         self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+        result = super()._save_checkpoint()
+        if self._speco_entropy_lr_enabled():
+            self._speco_entropy_lr().save()
+        return result

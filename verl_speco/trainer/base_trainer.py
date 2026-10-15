@@ -21,6 +21,7 @@ import asyncio
 import random
 import fnmatch
 import shutil
+import copy
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Any, cast
@@ -59,6 +60,7 @@ from verl_speco.trainer.dspark_training_config import (
     dspark_target_distribution_loss_enabled,
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.state_diagnostics import record as record_state_diagnostics, trace_state
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -165,9 +167,10 @@ def alignment_debug_rank_selected(rank: int | None) -> bool:
 class _DrafterOptimizerState:
     """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, *, initialize_missing_state: bool = True):
         self.model = model
         self.optimizer = optimizer
+        self.initialize_missing_state = initialize_missing_state
 
     @staticmethod
     def _options():
@@ -177,6 +180,28 @@ class _DrafterOptimizerState:
 
     def state_dict(self):
         from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+        if not self.optimizer.state and not self.initialize_missing_state:
+            parameter_names = {
+                id(parameter): name for name, parameter in self.model.named_parameters()
+            }
+            param_groups = []
+            for group in self.optimizer.param_groups:
+                saved_group = {
+                    key: copy.deepcopy(value)
+                    for key, value in group.items()
+                    if key != "params"
+                }
+                try:
+                    saved_group["params"] = [
+                        parameter_names[id(parameter)] for parameter in group["params"]
+                    ]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "Drafter optimizer contains a parameter not owned by the model"
+                    ) from exc
+                param_groups.append(saved_group)
+            return {"state": {}, "param_groups": param_groups}
 
         return get_optimizer_state_dict(
             self.model, self.optimizer, options=self._options()
@@ -818,7 +843,12 @@ class DrafterBaseTrainer:
             )
         first_ce_tokens = sums.get(f"{prefix}/first_rejection_ce_token_count", 0.0)
         if first_ce_tokens > 0:
-            first_ce = sums.get(f"{prefix}/first_rejection_ce_loss_sum", 0.0) / first_ce_tokens
+            first_ce_weight = sums.get(
+                f"{prefix}/first_rejection_ce_weight_sum", first_ce_tokens
+            )
+            if first_ce_weight <= 0:
+                first_ce_weight = first_ce_tokens
+            first_ce = sums.get(f"{prefix}/first_rejection_ce_loss_sum", 0.0) / first_ce_weight
             metrics[f"{prefix}/first_rejection_ce_loss"] = first_ce
             metrics[f"{prefix}/first_rejection_ce_q_prob"] = (
                 sums.get(f"{prefix}/first_rejection_ce_q_prob_sum", 0.0) / first_ce_tokens
@@ -909,12 +939,20 @@ class DrafterBaseTrainer:
                 sums.get(f"{prefix}/rejected_k3_linearized_count", 0.0)
                 / rejection_tokens
             )
+            rejected_aux_alpha = sums.get(
+                f"{prefix}/rejected_aux_alpha", 0.0
+            ) / max(sums.get(f"{prefix}/metric_replica_count", 0.0), 1.0)
+            metrics[f"{prefix}/rejected_aux_contribution"] = (
+                rejected_aux_alpha * rejected_k3_mean
+            )
             self._add_k3_distribution_metrics(metrics, sums, prefix, "rejected")
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/first_rejection_ce_token_count",
+            f"{prefix}/first_rejection_ce_weight_sum",
+            f"{prefix}/first_rejection_ce_boosted_count",
             f"{prefix}/l1_weighted_token_count",
             f"{prefix}/accepted_fkl_weighted_count",
             f"{prefix}/accepted_k3_weighted_count",
@@ -942,6 +980,8 @@ class DrafterBaseTrainer:
                 "topk_union_enabled",
                 "first_rejection_ce_enabled",
                 "first_rejection_ce_alpha",
+                "rejected_aux_alpha",
+                "rejected_prefix_length",
                 "asymmetric_k3_enabled",
                 "accepted_asymmetric_k3_enabled",
                 "rejected_asymmetric_k3_enabled",
@@ -1117,7 +1157,11 @@ class DrafterBaseTrainer:
             "first_rejection_ce_alpha",
             "first_rejection_ce_loss_sum",
             "first_rejection_ce_token_count",
+            "first_rejection_ce_weight_sum",
+            "first_rejection_ce_boosted_count",
             "first_rejection_ce_q_prob_sum",
+            "rejected_aux_alpha",
+            "rejected_prefix_length",
             "l1_loss_sum",
             "l1_weighted_token_count",
             "accepted_fkl_sum",
@@ -1333,6 +1377,9 @@ class DrafterBaseTrainer:
             ),
             "streams": cpu_streams,
         }
+        state_diag = getattr(self, "_state_diagnostics", None)
+        if state_diag is not None and state_diag.last_forward is not None:
+            payload["state_diagnostics"] = dict(state_diag.last_forward)
         try:
             os.makedirs(step_dir, exist_ok=True)
             self._atomic_torch_save(payload, output_path)
@@ -1658,6 +1705,7 @@ class DrafterBaseTrainer:
 
         return trainable_state_dict
 
+    @trace_state
     def _get_full_export_state_dict(self) -> dict[str, torch.Tensor]:
         """Get a complete CPU state dict for offline drafter export.
 
@@ -1676,7 +1724,10 @@ class DrafterBaseTrainer:
         if not full_state_dict:
             return {}
         return {
-            name: tensor.detach().cpu().contiguous()
+            # The DCP/FSDP full-state API may return an already-contiguous CPU
+            # tensor.  cpu().contiguous() would then preserve its storage, so a
+            # background writer/reclaim could outlive or alias FSDP staging.
+            name: tensor.detach().to(device="cpu", copy=True).contiguous()
             for name, tensor in full_state_dict.items()
             if isinstance(tensor, torch.Tensor)
         }
@@ -1886,7 +1937,13 @@ class DrafterBaseTrainer:
             import torch.distributed.checkpoint as dcp
 
             dcp.save(
-                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                {
+                    "optimizer": _DrafterOptimizerState(
+                        self.model,
+                        self.optimizer,
+                        initialize_missing_state=False,
+                    )
+                },
                 checkpoint_id=temporary_path,
                 process_group=self._checkpoint_process_group(),
             )
@@ -1917,6 +1974,7 @@ class DrafterBaseTrainer:
             "format": "torch_distributed_checkpoint",
             "path": "optimizer",
             "trainer_state_file": trainer_state_file,
+            "state_initialized": bool(self.optimizer.state),
             "save_sp_world_size": int(self._get_sp_world_size()),
             "save_dp_world_size": int(self._get_dp_world_size()),
         }
@@ -1954,14 +2012,16 @@ class DrafterBaseTrainer:
             )
 
         try:
-            import torch.distributed.checkpoint as dcp
+            optimizer_metadata = metadata["optimizer"]
+            if optimizer_metadata.get("state_initialized") is not False:
+                import torch.distributed.checkpoint as dcp
 
-            dcp.load(
-                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
-                checkpoint_id=optimizer_path,
-                process_group=self._checkpoint_process_group(),
-            )
-            trainer_state_file = metadata["optimizer"]["trainer_state_file"]
+                dcp.load(
+                    {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                    checkpoint_id=optimizer_path,
+                    process_group=self._checkpoint_process_group(),
+                )
+            trainer_state_file = optimizer_metadata["trainer_state_file"]
             trainer_state_path = os.path.join(optimizer_path, trainer_state_file)
             try:
                 trainer_state = torch.load(
@@ -1989,6 +2049,8 @@ class DrafterBaseTrainer:
         checkpoint_path: str,
         step: int,
         optimizer_manifest: dict[str, Any] | None,
+        *,
+        reclaim_in_writer: bool = True,
     ):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
@@ -2082,20 +2144,21 @@ class DrafterBaseTrainer:
                 }
             finally:
                 model_state_dict.clear()
-                reclaim = release_checkpoint_host_memory(
-                    checkpoint_path if checkpoint_complete else None,
-                    drop_file_cache=checkpoint_complete,
-                )
-                logger.warning(
-                    "[drafter checkpoint] step=%s phase=reclaim elapsed=%.2fs files=%s failed=%s %s",
-                    step,
-                    reclaim["elapsed_sec"],
-                    reclaim["files_advised"],
-                    reclaim["files_failed"],
-                    format_checkpoint_memory_snapshot(),
-                )
-                if write_result is not None:
-                    write_result["reclaim_elapsed"] = reclaim["elapsed_sec"]
+                if reclaim_in_writer:
+                    reclaim = release_checkpoint_host_memory(
+                        checkpoint_path if checkpoint_complete else None,
+                        drop_file_cache=checkpoint_complete,
+                    )
+                    logger.warning(
+                        "[drafter checkpoint] step=%s phase=reclaim elapsed=%.2fs files=%s failed=%s %s",
+                        step,
+                        reclaim["elapsed_sec"],
+                        reclaim["files_advised"],
+                        reclaim["files_failed"],
+                        format_checkpoint_memory_snapshot(),
+                    )
+                    if write_result is not None:
+                        write_result["reclaim_elapsed"] = reclaim["elapsed_sec"]
             return write_result
 
         if self._full_checkpoint_executor is None:
@@ -2116,6 +2179,8 @@ class DrafterBaseTrainer:
         step: int,
         optimizer_manifest: dict[str, Any] | None,
         is_final: bool = False,
+        *,
+        reclaim_in_writer: bool = True,
     ):
         """Asynchronously save a directly loadable drafter checkpoint.
 
@@ -2134,8 +2199,10 @@ class DrafterBaseTrainer:
             checkpoint_path,
             step,
             optimizer_manifest,
+            reclaim_in_writer=reclaim_in_writer,
         )
 
+    @trace_state
     def save_checkpoint(
         self,
         step: int,
@@ -2196,6 +2263,7 @@ class DrafterBaseTrainer:
         write_elapsed = 0.0
         offload_elapsed = 0.0
         reclaim_elapsed = 0.0
+        checkpoint_write_complete = False
         try:
             if include_optimizer:
                 optimizer_started = time.perf_counter()
@@ -2215,6 +2283,7 @@ class DrafterBaseTrainer:
             future = self._save_checkpoint_async(
                 int(step),
                 optimizer_manifest,
+                reclaim_in_writer=not wait,
             )
             if wait and future is not None:
                 try:
@@ -2222,6 +2291,7 @@ class DrafterBaseTrainer:
                 finally:
                     self._pending_full_checkpoint_future = None
                 if isinstance(write_result, dict):
+                    checkpoint_write_complete = True
                     export_elapsed = float(
                         write_result.get("export_elapsed", 0.0) or 0.0
                     )
@@ -2234,11 +2304,15 @@ class DrafterBaseTrainer:
                 offload_started = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
                 offload_elapsed = time.perf_counter() - offload_started
-            # The full-checkpoint writer already clears its state dict and
-            # reclaims once. Ranks without a full-weight write still need one
-            # local cleanup for optimizer/export staging.
-            if future is None:
-                reclaim = release_checkpoint_host_memory()
+            # For synchronous saves, reclaim only after every rank has moved
+            # its live FSDP shard back to CPU.  Reclaiming in the leader's
+            # writer before this offload made rank 0 uniquely vulnerable to
+            # allocator decay while FSDP2 still retained staging references.
+            if future is None or wait:
+                reclaim = release_checkpoint_host_memory(
+                    checkpoint_path if checkpoint_write_complete else None,
+                    drop_file_cache=checkpoint_write_complete,
+                )
                 reclaim_elapsed = reclaim["elapsed_sec"]
 
         if self._is_checkpoint_leader():
@@ -2296,6 +2370,7 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         return {"waited": True, "completed": True, "reason": "completed"}
 
+    @trace_state
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
@@ -2358,6 +2433,7 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
+    @trace_state
     def sync_target_lm_head_weight(
         self,
         weight: torch.Tensor,
@@ -3422,6 +3498,7 @@ class DrafterBaseTrainer:
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "hidden_window_stratum": batch.get("hidden_window_stratum"),
                 "speculative_trace": batch.get("speculative_trace"),
+                "low_entropy_sampling_active": batch.get("low_entropy_sampling_active", True),
                 "speculative_trace_diagnostics": batch.get(
                     "speculative_trace_diagnostics"
                 ),
@@ -3435,6 +3512,7 @@ class DrafterBaseTrainer:
                 and _has_mappable_verify_event(data_item)
             )
             if is_fixed_eval_holdout:
+                data_item["_speco_fixed_eval_holdout"] = True
                 self.fixed_eval_data.append(data_item)
                 if self.fixed_eval_source_step is None:
                     self.fixed_eval_source_step = self.current_rl_step
@@ -3966,6 +4044,7 @@ class DrafterBaseTrainer:
         trace_draft_token_id_chunks = []
         trace_draft_teacher_logprob_chunks = []
         trace_draft_teacher_logprob_mask_chunks = []
+        trace_first_rejection_teacher_entropy_chunks = []
         trace_bonus_response_anchor_mask_chunks = []
         trace_topk_chunks = {
             key: []
@@ -4001,6 +4080,9 @@ class DrafterBaseTrainer:
         )
         trace_draft_teacher_logprob_mask_list = preprocessed_lists.get(
             "trace_draft_teacher_logprob_mask"
+        )
+        trace_first_rejection_teacher_entropy_list = preprocessed_lists.get(
+            "trace_first_rejection_teacher_entropies"
         )
         trace_bonus_response_anchor_mask_list = preprocessed_lists.get(
             "trace_bonus_response_anchor_mask"
@@ -4047,6 +4129,7 @@ class DrafterBaseTrainer:
                     trace_draft_token_id_list,
                     trace_draft_teacher_logprob_list,
                     trace_draft_teacher_logprob_mask_list,
+                    trace_first_rejection_teacher_entropy_list,
                     trace_bonus_response_anchor_mask_list,
                 )
                 if any(
@@ -4434,6 +4517,9 @@ class DrafterBaseTrainer:
                 trace_draft_teacher_logprob_mask_chunks.append(
                     trace_draft_teacher_logprob_mask_list[item_idx]
                 )
+                trace_first_rejection_teacher_entropy_chunks.append(
+                    trace_first_rejection_teacher_entropy_list[item_idx]
+                )
                 trace_bonus_response_anchor_mask_chunks.append(
                     trace_bonus_response_anchor_mask_list[item_idx]
                 )
@@ -4536,6 +4622,7 @@ class DrafterBaseTrainer:
             trace_draft_token_ids = None
             trace_draft_teacher_logprobs = None
             trace_draft_teacher_logprob_mask = None
+            trace_first_rejection_teacher_entropies = None
             trace_bonus_response_anchor_mask = None
             if dspark_trace_aligned:
                 if len(trace_anchor_position_chunks) != len(input_id_chunks):
@@ -4586,6 +4673,10 @@ class DrafterBaseTrainer:
                 trace_draft_teacher_logprob_mask = torch.zeros_like(
                     trace_draft_teacher_logprobs, dtype=torch.bool
                 )
+                trace_first_rejection_teacher_entropies = torch.full(
+                    trace_anchor_positions.shape, float("nan"),
+                    dtype=torch.float32, device=dev,
+                )
                 trace_bonus_response_anchor_mask = torch.zeros_like(
                     trace_anchor_positions, dtype=torch.bool
                 )
@@ -4597,6 +4688,7 @@ class DrafterBaseTrainer:
                     draft_token_chunk,
                     teacher_logprob_chunk,
                     teacher_logprob_mask_chunk,
+                    first_rejection_teacher_entropy_chunk,
                     bonus_response_anchor_mask_chunk,
                 ) in enumerate(
                     zip(
@@ -4607,6 +4699,7 @@ class DrafterBaseTrainer:
                         trace_draft_token_id_chunks,
                         trace_draft_teacher_logprob_chunks,
                         trace_draft_teacher_logprob_mask_chunks,
+                        trace_first_rejection_teacher_entropy_chunks,
                         trace_bonus_response_anchor_mask_chunks,
                     )
                 ):
@@ -4622,6 +4715,9 @@ class DrafterBaseTrainer:
                     )
                     trace_draft_teacher_logprob_mask[row_idx, :width] = (
                         teacher_logprob_mask_chunk
+                    )
+                    trace_first_rejection_teacher_entropies[row_idx, :width] = (
+                        first_rejection_teacher_entropy_chunk
                     )
                     trace_bonus_response_anchor_mask[row_idx, :width] = (
                         bonus_response_anchor_mask_chunk
@@ -4693,6 +4789,7 @@ class DrafterBaseTrainer:
                     "trace_draft_token_ids": trace_draft_token_ids,
                     "trace_draft_teacher_logprobs": trace_draft_teacher_logprobs,
                     "trace_draft_teacher_logprob_mask": trace_draft_teacher_logprob_mask,
+                    "trace_first_rejection_teacher_entropies": trace_first_rejection_teacher_entropies,
                     "trace_bonus_response_anchor_mask": trace_bonus_response_anchor_mask,
                 }
             )
@@ -4730,6 +4827,9 @@ class DrafterBaseTrainer:
             trace_draft_teacher_logprobs = batch["trace_draft_teacher_logprobs"]
             trace_draft_teacher_logprob_mask = batch[
                 "trace_draft_teacher_logprob_mask"
+            ]
+            trace_first_rejection_teacher_entropies = batch[
+                "trace_first_rejection_teacher_entropies"
             ]
             trace_bonus_response_anchor_mask = batch[
                 "trace_bonus_response_anchor_mask"
@@ -4835,6 +4935,7 @@ class DrafterBaseTrainer:
                     "trace_draft_token_ids": trace_draft_token_ids,
                     "trace_draft_teacher_logprobs": trace_draft_teacher_logprobs,
                     "trace_draft_teacher_logprob_mask": trace_draft_teacher_logprob_mask,
+                    "trace_first_rejection_teacher_entropies": trace_first_rejection_teacher_entropies,
                     "trace_bonus_response_anchor_mask": trace_bonus_response_anchor_mask,
                 }
             )
@@ -4954,6 +5055,181 @@ class DrafterBaseTrainer:
                 )
 
         return batch
+
+    def score_directional_candidates(
+        self,
+        item: dict[str, Any],
+        old_sample: dict[str, Any],
+        old_hidden: torch.Tensor,
+        old_head_weight: torch.Tensor,
+        *,
+        diagnostic: bool = False,
+        selected_anchors: list[int] | None = None,
+    ) -> list[tuple[int, float, float]] | dict[str, Any]:
+        """Score trace anchors under old actor, new actor, and frozen drafter."""
+        from verl_speco.trainer.directional_sampling import paired_repair_scores
+
+        if self.backend.model_type != "dspark" or not self._training_active:
+            raise RuntimeError("Directional probe requires an active DSpark trainer")
+        if self._target_lm_head_weight_step != self.current_rl_step:
+            raise RuntimeError("Directional probe has no current-actor output head")
+        old_ids = old_sample["input_ids"].reshape(-1)
+        feature_start = int(item["_verl_feature_start"])
+        feature_end = int(item["_verl_feature_end"])
+        if not torch.equal(old_ids[feature_start:feature_end], item["input_ids"].reshape(-1)):
+            raise ValueError("Directional actor distributions have different token prefixes")
+
+        old_positions = old_sample["hidden_positions"].reshape(-1).long().cpu()
+        new_positions = item["hidden_positions"].reshape(-1).long().cpu()
+        if not torch.equal(old_positions, new_positions):
+            raise ValueError("Directional actor hidden rows have different positions")
+        old_hidden = old_hidden.squeeze(0) if old_hidden.ndim == 3 else old_hidden
+        if old_hidden.ndim != 2 or old_hidden.size(0) != old_positions.numel():
+            raise ValueError("Directional old actor hidden rows are incomplete")
+
+        item["_speco_directional_probe"] = True
+        try:
+            batch = self._prepare_training_batch(
+                items_override=[item], track_sample_usage=False
+            )
+        finally:
+            item.pop("_speco_directional_probe", None)
+        if batch is None:
+            return []
+        mask = batch["trace_anchor_mask"][0].bool()
+        anchors = batch["trace_anchor_positions"][0][mask]
+        accepted_counts = batch["trace_accepted_counts"][0][mask] if "trace_accepted_counts" in batch else None
+        draft_counts = batch["trace_draft_counts"][0][mask] if "trace_draft_counts" in batch else None
+        if anchors.numel() == 0:
+            return {"rows": []} if diagnostic else []
+        if selected_anchors is not None:
+            desired = set(selected_anchors)
+            keep = torch.tensor(
+                [int(anchor) in desired for anchor in anchors.detach().cpu().tolist()],
+                dtype=torch.bool, device=anchors.device,
+            )
+            if not bool(keep.any()):
+                return {"rows": []}
+            anchors = anchors[keep]
+            if accepted_counts is not None:
+                accepted_counts = accepted_counts[keep]
+            if draft_counts is not None:
+                draft_counts = draft_counts[keep]
+        absolute_positions = batch["position_ids"][0, anchors].long().cpu()
+        lookup = {int(position): index for index, position in enumerate(old_positions.tolist())}
+        try:
+            old_rows = torch.tensor(
+                [lookup[int(position)] for position in absolute_positions.tolist()],
+                dtype=torch.long,
+            )
+        except KeyError as exc:
+            raise ValueError("Directional candidate lacks an old actor hidden row") from exc
+
+        device = batch["input_ids"].device
+        head = self.backend.target_lm_head.fc.weight
+        if old_head_weight.shape != head.shape:
+            raise ValueError("Directional actor output heads have different vocabularies")
+        hidden_size = int(head.size(1))
+        old_last = old_hidden.index_select(0, old_rows)[..., -hidden_size:].to(
+            device=device, dtype=head.dtype
+        )
+        new_last = batch["target_last_hidden_states"][0, anchors]
+        model = self.model
+        original_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                context = batch["hidden_states"]
+                num_layers = (
+                    model.module if hasattr(model, "module") else model
+                ).draft_model.num_context_layers
+                if context.size(-1) % num_layers:
+                    raise ValueError("Directional context feature dimension is misaligned")
+                features = list(context.split(context.size(-1) // num_layers, dim=-1))
+                all_q_logits = model(
+                    input_ids=batch["input_ids"],
+                    hidden_states_list=features,
+                    loss_mask=batch["loss_mask"],
+                    lm_head_weight=head,
+                    trace_anchor_positions=batch["trace_anchor_positions"],
+                    trace_anchor_mask=batch["trace_anchor_mask"],
+                    position_ids=batch.get("position_ids"),
+                    return_first_token_logits=True,
+                )[0, mask]
+                q_logits = all_q_logits if selected_anchors is None else all_q_logits[keep]
+                old_logits = torch.nn.functional.linear(
+                    old_last, old_head_weight.to(device=device, dtype=head.dtype)
+                )
+                new_logits = torch.nn.functional.linear(new_last, head)
+                scores = paired_repair_scores(old_logits, new_logits, q_logits)
+                if diagnostic and selected_anchors is not None:
+                    repeat_q_logits = model(
+                        input_ids=batch["input_ids"],
+                        hidden_states_list=features,
+                        loss_mask=batch["loss_mask"],
+                        lm_head_weight=head,
+                        trace_anchor_positions=batch["trace_anchor_positions"],
+                        trace_anchor_mask=batch["trace_anchor_mask"],
+                        position_ids=batch.get("position_ids"),
+                        return_first_token_logits=True,
+                    )[0, mask][keep]
+                    repeat_q = torch.softmax(repeat_q_logits.float(), -1)
+                    q_old = None
+                    context_positions = batch["position_ids"][0].long().cpu().tolist()
+                    if (old_hidden.size(-1) == context.size(-1)
+                            and all(int(position) in lookup for position in context_positions)):
+                        old_context = old_hidden.index_select(
+                            0, torch.tensor([lookup[int(p)] for p in context_positions])
+                        ).to(device=device, dtype=context.dtype).unsqueeze(0)
+                        old_features = list(old_context.split(old_context.size(-1) // num_layers, -1))
+                        q_old_logits = model(
+                            input_ids=batch["input_ids"],
+                            hidden_states_list=old_features,
+                            loss_mask=batch["loss_mask"],
+                            lm_head_weight=head,
+                            trace_anchor_positions=batch["trace_anchor_positions"],
+                            trace_anchor_mask=batch["trace_anchor_mask"],
+                            position_ids=batch.get("position_ids"),
+                            return_first_token_logits=True,
+                        )[0, mask][keep]
+                        q_old = torch.softmax(q_old_logits.float(), -1).cpu()
+        finally:
+            model.train(original_training)
+        if diagnostic:
+            rows = []
+            absolute = absolute_positions.tolist()
+            for index, anchor in enumerate(anchors.detach().cpu().tolist()):
+                rows.append({
+                    "anchor": int(anchor), "absolute_position": int(absolute[index]),
+                    "surplus": float(scores["surplus"][index]),
+                    "deficit": float(scores["deficit"][index]),
+                    "m": float(scores["m"][index]),
+                    "current_tv": float(scores["current_tv"][index]),
+                    "actor_tv": float(scores["actor_tv"][index]),
+                    "actor_entropy": float(scores["actor_entropy"][index]),
+                    "trace_accepted_count": int(accepted_counts[index]) if accepted_counts is not None else None,
+                    "trace_draft_count": int(draft_counts[index]) if draft_counts is not None else None,
+                })
+            if selected_anchors is None:
+                return {"rows": rows}
+            result = {
+                "rows": rows,
+                "old": torch.softmax(old_logits.float(), -1).cpu(),
+                "new": torch.softmax(new_logits.float(), -1).cpu(),
+                "draft": torch.softmax(q_logits.float(), -1).cpu(),
+                "repeat_draft": repeat_q.cpu(),
+                "old_feature_draft": q_old,
+            }
+            return result
+        return [
+            (int(anchor), float(m), float(tv))
+            for anchor, m, tv in zip(
+                anchors.detach().cpu().tolist(),
+                scores["m"].detach().cpu().tolist(),
+                scores["current_tv"].detach().cpu().tolist(),
+                strict=True,
+            )
+        ]
 
     def _sync_batch_readiness(self, has_local_batch: bool) -> bool:
         readiness = torch.tensor(
@@ -5179,6 +5455,8 @@ class DrafterBaseTrainer:
             "auxiliary_token_count",
             "first_rejection_ce_loss_sum",
             "first_rejection_ce_token_count",
+            "first_rejection_ce_weight_sum",
+            "first_rejection_ce_boosted_count",
             "first_rejection_ce_q_prob_sum",
             "ce_loss_sum",
             "ce_weighted_token_count",
@@ -5278,9 +5556,11 @@ class DrafterBaseTrainer:
         result = {
             "loss": total_loss,
             "first_rejection_ce_loss": (
-                values["first_rejection_ce_loss_sum"] / values["first_rejection_ce_token_count"]
-                if values["first_rejection_ce_token_count"] > 0 else 0.0
+                values["first_rejection_ce_loss_sum"] / values["first_rejection_ce_weight_sum"]
+                if values["first_rejection_ce_weight_sum"] > 0 else 0.0
             ),
+            "first_rejection_ce_boosted_count": values["first_rejection_ce_boosted_count"],
+            "first_rejection_ce_weight_sum": values["first_rejection_ce_weight_sum"],
             "first_rejection_ce_q_prob": (
                 values["first_rejection_ce_q_prob_sum"] / values["first_rejection_ce_token_count"]
                 if values["first_rejection_ce_token_count"] > 0 else 0.0
@@ -5401,6 +5681,26 @@ class DrafterBaseTrainer:
             global_count,
         )
 
+    def _reduce_auxiliary_losses(
+        self, loss_dict: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce one or more independently normalized auxiliary objectives."""
+        auxiliaries = loss_dict.get("auxiliary_losses")
+        if auxiliaries is None:
+            return self._reduce_auxiliary_loss(loss_dict)
+        zero = loss_dict["total_local_ploss"].new_zeros(())
+        metric, backward, tokens = zero, zero, zero
+        for auxiliary in auxiliaries:
+            current = dict(loss_dict, auxiliary_loss=auxiliary)
+            current.pop("auxiliary_losses", None)
+            item_metric, item_backward, item_tokens = self._reduce_auxiliary_loss(
+                current
+            )
+            metric = metric + item_metric
+            backward = backward + item_backward
+            tokens = tokens + item_tokens
+        return metric, backward, tokens
+
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
@@ -5419,7 +5719,9 @@ class DrafterBaseTrainer:
                     for key, value in batch.items()
                     if not key.startswith("_speco_")
                 }
+                record_state_diagnostics(self, "before_forward", batch, pad_size)
                 loss_dict = self.backend.compute_loss(self.model, loss_batch, pad_size)
+                record_state_diagnostics(self, "after_forward", loss_dict)
 
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
@@ -5435,7 +5737,7 @@ class DrafterBaseTrainer:
             self._reduce_loss_metrics(l_v, l_p, l_n)
         )
         auxiliary_loss, local_auxiliary_loss, auxiliary_tokens = (
-            self._reduce_auxiliary_loss(loss_dict)
+            self._reduce_auxiliary_losses(loss_dict)
         )
         self.record_training_timing(
             "timing_s/drafter_reduce_loss", time.time() - reduce_ts
@@ -5631,6 +5933,7 @@ class DrafterBaseTrainer:
         self._candidate_optimizer_steps_total = None
         self._candidate_scheduler_state = None
         self._candidate_optimizer_lrs = None
+        self._candidate_optimizer_state = None
 
     def begin_candidate_update(self, global_step: Optional[int]) -> bool:
         """Snapshot the serving state and local trainable shards before training."""
@@ -5649,11 +5952,18 @@ class DrafterBaseTrainer:
         self._candidate_training_steps = int(self.training_steps)
         self._candidate_optimizer_steps_total = int(self.optimizer_steps_total)
         if self.lr_scheduler is not None:
-            self._candidate_scheduler_state = self.lr_scheduler.state_dict()
+            self._candidate_scheduler_state = copy.deepcopy(self.lr_scheduler.state_dict())
         if self.optimizer is not None:
             self._candidate_optimizer_lrs = [
                 float(group.get("lr", 0.0)) for group in self.optimizer.param_groups
             ]
+            if self.config.rollout.drafter.training.get("entropy_lr_enabled", False):
+                from torch.utils._pytree import tree_map
+
+                self._candidate_optimizer_state = tree_map(
+                    lambda value: value.detach().cpu().clone() if torch.is_tensor(value) else copy.deepcopy(value),
+                    self.optimizer.state_dict(),
+                )
         return bool(self._candidate_baseline_state_dict) or self.rank != 0
 
     def prepare_candidate_update(self, global_step: Optional[int]) -> bool:
@@ -5730,11 +6040,13 @@ class DrafterBaseTrainer:
                             local.copy_(baseline)
                         else:
                             local.lerp_(baseline, 1.0 - alpha)
-                # Adam moments correspond only to the full candidate. Reset them
-                # after rollback/partial interpolation instead of carrying stale
-                # momentum into the next update.
+                # Exact rollback restores saved Adam moments when available.
+                # Otherwise clear candidate moments after rollback/interpolation.
                 if self.optimizer is not None:
-                    self.optimizer.state.clear()
+                    if alpha == 0.0 and self._candidate_optimizer_state is not None:
+                        self.optimizer.load_state_dict(self._candidate_optimizer_state)
+                    else:
+                        self.optimizer.state.clear()
                     if alpha == 0.0:
                         for group, lr in zip(
                             self.optimizer.param_groups,
@@ -5762,6 +6074,7 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True
 
+    @trace_state
     def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
         """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
         self.clear_pending_publish_state_dict()
@@ -5770,6 +6083,7 @@ class DrafterBaseTrainer:
         self._pending_publish_state_dict = state_dict
         self._pending_publish_step = step
         self._pending_publish_ready = True
+        record_state_diagnostics(self, "publish_payload", state_dict, step)
         return bool(state_dict)
 
     def pop_model_state_dict_for_publish(
@@ -5794,6 +6108,7 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True, state_dict
 
+    @trace_state
     async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
@@ -5949,6 +6264,7 @@ class DrafterBaseTrainer:
         self._last_ckpt_step = -1
         self.training_steps = 0
 
+    @trace_state
     async def release_training_memory_after_activation(self):
         """Release runtime-device memory after a pre-fit activation warmup."""
 

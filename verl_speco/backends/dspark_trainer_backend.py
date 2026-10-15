@@ -51,8 +51,23 @@ def _trace_anchor_rows_for_item(
     crop_end: int,
     num_anchors: int,
     block_size: int,
+    low_entropy_fraction: float = 0.0,
+    low_entropy_threshold: float = 0.01,
+    position_stratified_low_entropy: bool = False,
+    require_rejected_logprob: bool = False,
+    low_entropy_max_rejected_logprob: float = -4.0,
+    selection_stats: Optional[dict[str, int]] = None,
+    eligible_reserve_anchors: Optional[set[int]] = None,
+    forced_reserved_anchors: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
     """Map request-level verify events into a cropped DSpark training window."""
+
+    if not math.isfinite(low_entropy_fraction) or not 0 <= low_entropy_fraction <= 1:
+        raise ValueError("low_entropy_fraction must be in [0, 1]")
+    if not math.isfinite(low_entropy_threshold) or low_entropy_threshold <= 0:
+        raise ValueError("low_entropy_threshold must be finite and positive")
+    if position_stratified_low_entropy and not math.isfinite(low_entropy_max_rejected_logprob):
+        raise ValueError("low_entropy_max_rejected_logprob must be finite")
 
     trace = item.get("speculative_trace")
     if not isinstance(trace, (list, tuple)) or not trace:
@@ -67,6 +82,8 @@ def _trace_anchor_rows_for_item(
 
     sample_id = str(item.get("sample_id", ""))
     rows_by_anchor: dict[int, dict[str, Any]] = {}
+    low_entropy_anchors: set[int] = set()
+    rejection_count = entropy_count = 0
 
     def keep_row(row: dict[str, Any]) -> None:
         anchor = int(row["anchor"])
@@ -143,6 +160,15 @@ def _trace_anchor_rows_for_item(
             "big",
         )
         raw_teacher_logprobs = event.get("draft_teacher_logprobs")
+        raw_entropies = event.get("draft_teacher_entropies")
+        first_rejection_entropy = None
+        if not all_accepted and isinstance(raw_entropies, (list, tuple)):
+            try:
+                entropy = float(raw_entropies[accepted_count])
+                if math.isfinite(entropy) and entropy >= 0:
+                    first_rejection_entropy = entropy
+            except (TypeError, ValueError, IndexError):
+                pass
         teacher_logprobs = [0.0] * draft_count
         teacher_logprob_mask = [False] * draft_count
         if isinstance(raw_teacher_logprobs, (list, tuple)):
@@ -165,6 +191,8 @@ def _trace_anchor_rows_for_item(
             "draft_token_ids": draft_token_ids,
             "draft_teacher_logprobs": teacher_logprobs,
             "draft_teacher_logprob_mask": teacher_logprob_mask,
+            "first_rejection_entropy": first_rejection_entropy,
+            "response_position": response_start + accepted_count,
             "all_accepted": all_accepted,
             "bonus_response_anchor": False,
             "priority": priority,
@@ -174,6 +202,19 @@ def _trace_anchor_rows_for_item(
                 row[key] = event[key]
         if primary_anchor_in_crop:
             keep_row(row)
+            # Only the actual first rejection is a reached teacher context.
+            # Unverified suffix entropy must not influence the sampling policy.
+            if not all_accepted and local_anchor + 1 + accepted_count < crop_end - crop_start:
+                rejection_count += 1
+                entropies = event.get("draft_teacher_entropies")
+                try:
+                    entropy = float(entropies[accepted_count])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    entropy = float("nan")
+                if math.isfinite(entropy) and entropy >= 0:
+                    entropy_count += 1
+                    if entropy < low_entropy_threshold:
+                        low_entropy_anchors.add(local_anchor)
 
         # DSpark emits K query states for K proposals, so the K+1 target-model
         # bonus token has no query in the original all-accepted verify block.
@@ -224,10 +265,60 @@ def _trace_anchor_rows_for_item(
                     }
                 )
 
-    selected = sorted(
+    ranked = sorted(
         rows_by_anchor.values(),
         key=lambda row: (int(row["priority"]), int(row["anchor"])),
-    )[: max(int(num_anchors), 0)]
+    )
+    budget = min(max(int(num_anchors), 0), len(ranked))
+    eligible = [
+        row for row in ranked
+        if row["anchor"] in low_entropy_anchors and not row["all_accepted"]
+        and (not (position_stratified_low_entropy or require_rejected_logprob) or (
+            row["draft_teacher_logprob_mask"][row["accepted_count"]]
+            and row["draft_teacher_logprobs"][row["accepted_count"]]
+            <= low_entropy_max_rejected_logprob
+        ))
+    ]
+    if eligible_reserve_anchors is not None:
+        eligible_reserve_anchors.clear()
+        eligible_reserve_anchors.update(int(row["anchor"]) for row in eligible)
+    reserve_count = int(budget * low_entropy_fraction)
+    if forced_reserved_anchors is not None:
+        forced = set(forced_reserved_anchors)
+        eligible_by_anchor = {row["anchor"]: row for row in eligible}
+        if len(forced) != len(forced_reserved_anchors) or not forced <= eligible_by_anchor.keys():
+            raise ValueError("Global sampling plan contains duplicate or ineligible anchors")
+        if len(forced) > reserve_count:
+            raise ValueError("Global sampling plan exceeds the per-window reserve")
+        reserved = [eligible_by_anchor[anchor] for anchor in forced_reserved_anchors]
+    elif position_stratified_low_entropy:
+        buckets = [[], [], []]
+        for row in eligible:
+            buckets[min(int(row["response_position"]) // 2048, 2)].append(row)
+        reserved = []
+        while len(reserved) < reserve_count and any(buckets):
+            for bucket in buckets:
+                if bucket and len(reserved) < reserve_count:
+                    reserved.append(bucket.pop(0))
+    else:
+        reserved = eligible[:reserve_count]
+    reserved_anchors = {row["anchor"] for row in reserved}
+    selected = reserved + [
+        row for row in ranked if row["anchor"] not in reserved_anchors
+    ][: budget - len(reserved)]
+    if selection_stats is not None:
+        eligible_anchors = {row["anchor"] for row in eligible}
+        for key, value in {
+            "candidates": len(ranked), "rejections": rejection_count,
+            "entropy_observed": entropy_count, "eligible": len(eligible),
+            "reserved": len(reserved), "selected": len(selected),
+            "selected_low_entropy": sum(row["anchor"] in eligible_anchors for row in selected),
+            "uniform_low_entropy": sum(row["anchor"] in eligible_anchors for row in ranked[:budget]),
+            "reserved_position_0_2047": sum(int(row["response_position"]) < 2048 for row in reserved),
+            "reserved_position_2048_4095": sum(2048 <= int(row["response_position"]) < 4096 for row in reserved),
+            "reserved_position_4096_plus": sum(int(row["response_position"]) >= 4096 for row in reserved),
+        }.items():
+            selection_stats[key] = selection_stats.get(key, 0) + value
     return sorted(selected, key=lambda row: int(row["anchor"]))
 
 
@@ -255,11 +346,16 @@ class DSparkTrainingModel(DFlashTrainingModel):
         ce_token_chunk_size: int = 64,
         ce_loss_alpha: float = 0.0,
         first_rejection_ce_alpha: float = 0.0,
+        first_rejection_ce_low_entropy_multiplier: float = 1.0,
+        first_rejection_ce_low_entropy_threshold: float = 0.01,
+        first_rejection_ce_max_rejected_logprob: float = -4.0,
         l1_loss_alpha: float = 0.0,
         confidence_head_alpha: float = 0.0,
         accepted_k3_alpha: float = 1.0,
         accepted_fkl_alpha: float = 0.0,
         rejected_k3_alpha: float = 1.0,
+        rejected_aux_alpha: float = 0.0,
+        rejected_prefix_length: int = 0,
         response_loss: str = "k3",
         rejected_loss: str = "k3",
         topk: int = 16,
@@ -303,11 +399,22 @@ class DSparkTrainingModel(DFlashTrainingModel):
         )
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.first_rejection_ce_alpha = float(first_rejection_ce_alpha)
+        self.first_rejection_ce_low_entropy_multiplier = float(
+            first_rejection_ce_low_entropy_multiplier
+        )
+        self.first_rejection_ce_low_entropy_threshold = float(
+            first_rejection_ce_low_entropy_threshold
+        )
+        self.first_rejection_ce_max_rejected_logprob = float(
+            first_rejection_ce_max_rejected_logprob
+        )
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.accepted_k3_alpha = float(accepted_k3_alpha)
         self.accepted_fkl_alpha = float(accepted_fkl_alpha)
         self.rejected_k3_alpha = float(rejected_k3_alpha)
+        self.rejected_aux_alpha = float(rejected_aux_alpha)
+        self.rejected_prefix_length = int(rejected_prefix_length)
         self.response_loss = str(response_loss).strip().lower()
         self.rejected_loss = str(rejected_loss).strip().lower()
         self.topk = int(topk)
@@ -385,12 +492,22 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "accepted_k3_alpha": self.accepted_k3_alpha,
             "accepted_fkl_alpha": self.accepted_fkl_alpha,
             "rejected_k3_alpha": self.rejected_k3_alpha,
+            "rejected_aux_alpha": self.rejected_aux_alpha,
             "response_stream_weight": self.response_stream_weight,
             "rejected_stream_weight": self.rejected_stream_weight,
         }
         for name, value in loss_weights.items():
             if value < 0:
                 raise ValueError(f"DSpark {name} must be non-negative, got {value}")
+        if not math.isfinite(self.rejected_aux_alpha) or self.rejected_aux_alpha < 0:
+            raise ValueError("DSpark rejected_aux_alpha must be finite and non-negative")
+        if self.rejected_prefix_length < 0:
+            raise ValueError("DSpark rejected_prefix_length must be non-negative")
+        if self.rejected_aux_alpha > 0:
+            if not trace_aligned_anchors:
+                raise ValueError("DSpark rejected_aux_alpha requires trace_aligned_anchors")
+            if self.rejected_prefix_length <= 0:
+                raise ValueError("DSpark rejected_aux_alpha requires a positive rejected_prefix_length")
         if (
             not math.isfinite(self.first_rejection_ce_alpha)
             or self.first_rejection_ce_alpha < 0
@@ -406,6 +523,20 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 "alpha=%s, separate global first-rejection mean",
                 self.first_rejection_ce_alpha,
             )
+        if not math.isfinite(self.first_rejection_ce_low_entropy_multiplier) or (
+            self.first_rejection_ce_low_entropy_multiplier < 1.0
+        ):
+            raise ValueError("DSpark first-rejection CE low-entropy multiplier must be finite and >= 1")
+        if not math.isfinite(self.first_rejection_ce_low_entropy_threshold) or (
+            self.first_rejection_ce_low_entropy_threshold <= 0
+        ):
+            raise ValueError("DSpark first-rejection CE low-entropy threshold must be finite and positive")
+        if not math.isfinite(self.first_rejection_ce_max_rejected_logprob) or (
+            self.first_rejection_ce_max_rejected_logprob > 0
+        ):
+            raise ValueError("DSpark first-rejection CE maximum rejected logprob must be finite and <= 0")
+        if self.first_rejection_ce_low_entropy_multiplier > 1 and self.first_rejection_ce_alpha <= 0:
+            raise ValueError("DSpark weighted first-rejection CE requires positive first_rejection_ce_alpha")
         if not 0.0 < self.rejected_position_decay <= 1.0:
             raise ValueError("DSpark rejected_position_decay must be in (0, 1]")
         for name in ("rejected_first_weight_multiplier", "rejected_suffix_weight_multiplier"):
@@ -1081,8 +1212,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
         token_indices = rejected_token_ids.long().unsqueeze(-1)
         log_q = draft_log_probs.gather(-1, token_indices).squeeze(-1)
         log_p = teacher_logprobs.float().detach()
+        # Asymmetric K3 has a bounded negative-tail derivative (exp(delta)-1
+        # approaches -1). A lower log-ratio clamp would silently discard this
+        # corrective gradient for confident teacher/drafter disagreements.
+        # Keep the positive cap and preserve both caps for the legacy policy.
         delta = (log_p - log_q).clamp(
-            min=-self.rejected_log_ratio_clamp,
+            min=(
+                None if self.rejected_asymmetric_k3_enabled
+                else -self.rejected_log_ratio_clamp
+            ),
             max=self.rejected_log_ratio_clamp,
         )
         k3, raw_k3, legacy_clamped, linearized = self._apply_k3_tail_policy(
@@ -1221,11 +1359,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
         trace_draft_token_ids: Optional[torch.Tensor] = None,
         trace_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         trace_draft_teacher_logprob_mask: Optional[torch.Tensor] = None,
+        trace_first_rejection_teacher_entropies: Optional[torch.Tensor] = None,
         trace_bonus_response_anchor_mask: Optional[torch.Tensor] = None,
         trace_draft_topk_ids: Optional[torch.Tensor] = None,
         trace_draft_topk_teacher_logprobs: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         global_context_mask: Optional[torch.Tensor] = None,
+        return_first_token_logits: bool = False,
     ):
         bsz, seq_len = input_ids.shape
         response_topk_stats = {}
@@ -1326,6 +1466,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
             noise_embedding=noise_embedding,
         ).view(bsz, n_blocks, self.block_size, -1)
 
+        if return_first_token_logits:
+            first_hidden = draft_hidden[:, :, 0, :].reshape(-1, draft_hidden.size(-1))
+            first_prev_tokens = torch.gather(
+                input_ids, 1, anchor_positions.clamp(0, seq_len - 1)
+            ).reshape(-1)
+            return self._full_vocab_logits(
+                first_hidden, lm_head_weight, first_prev_tokens
+            ).view(bsz, n_blocks, -1)
+
         target_ids, prev_token_ids, eval_mask, label_indices = (
             self._build_label_tensors(
                 input_ids=input_ids,
@@ -1357,6 +1506,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             if self.first_rejection_ce_alpha > 0 else local_ce_den.clone()
         )
         local_first_ce_count = local_ce_den.clone()
+        local_first_ce_weight_sum = local_ce_den.clone()
+        local_first_ce_boosted_count = local_ce_den.clone()
         local_first_ce_q_sum = local_ce_den.clone()
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
@@ -1497,12 +1648,22 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 & teacher_logprob_mask
                 & (draft_ids >= 0)
             )
+            if self.rejected_prefix_length > 0:
+                rejection_position_mask = rejection_position_mask & (
+                    trace_offsets - accepted_counts.unsqueeze(-1)
+                    < self.rejected_prefix_length
+                )
             if self.rejected_loss == "topk":
                 required_rejected = (
                     (trace_offsets >= accepted_counts.unsqueeze(-1))
                     & (trace_offsets < draft_counts.unsqueeze(-1))
                     & block_keep_mask.unsqueeze(-1)
                 )
+                if self.rejected_prefix_length > 0:
+                    required_rejected = required_rejected & (
+                        trace_offsets - accepted_counts.unsqueeze(-1)
+                        < self.rejected_prefix_length
+                    )
                 if (required_rejected & ~rejection_position_mask).any():
                     raise ValueError(
                         "DSpark rejected topk cannot skip missing verified teacher metadata"
@@ -1629,8 +1790,31 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 first_active = (
                     first_rejection_target_mask.reshape(-1)[active_mask] & finite_loss
                 )
-                local_first_ce_sum = active_loss[first_active].sum()
+                first_weights = torch.ones_like(active_loss[first_active])
+                if self.first_rejection_ce_low_entropy_multiplier > 1 and first_active.any():
+                    if trace_first_rejection_teacher_entropies is None:
+                        raise ValueError("Weighted first-rejection CE requires verify entropies")
+                    if trace_first_rejection_teacher_entropies.shape != anchor_positions.shape:
+                        raise ValueError("First-rejection verify entropies must match [batch, anchors]")
+                    first_entropies = trace_first_rejection_teacher_entropies.to(
+                        device=device, dtype=torch.float32
+                    ).unsqueeze(-1).expand_as(first_rejection_target_mask)
+                    first_entropies = first_entropies.reshape(-1)[active_mask][first_active]
+                    first_logprob_mask = teacher_logprob_mask.reshape(-1)[active_mask][first_active]
+                    first_logprobs = teacher_logprobs.reshape(-1)[active_mask][first_active]
+                    if not torch.isfinite(first_entropies).all() or not first_logprob_mask.all():
+                        raise ValueError("Weighted first-rejection CE requires finite entropy and candidate logprob")
+                    boosted = (
+                        (first_entropies < self.first_rejection_ce_low_entropy_threshold)
+                        & (first_logprobs <= self.first_rejection_ce_max_rejected_logprob)
+                    )
+                    first_weights = first_weights + boosted.to(first_weights.dtype) * (
+                        self.first_rejection_ce_low_entropy_multiplier - 1.0
+                    )
+                    local_first_ce_boosted_count = boosted.float().sum()
+                local_first_ce_sum = (active_loss[first_active] * first_weights).sum()
                 local_first_ce_count = first_active.float().sum()
+                local_first_ce_weight_sum = first_weights.sum()
                 local_first_ce_q_sum = (-active_loss[first_active].detach()).exp().sum()
             needs_accepted_distribution = (
                 self.accepted_k3_alpha > 0 or self.accepted_fkl_alpha > 0
@@ -1709,7 +1893,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
                                 active_draft_log_probs=reusable_draft_log_probs,
                             )
                         )
-            if rejection_position_mask.any() and self.rejected_k3_alpha > 0:
+            if rejection_position_mask.any() and (
+                self.rejected_k3_alpha > 0 or self.rejected_aux_alpha > 0
+            ):
                 if self.rejected_loss == "topk":
                     expected_shape = (
                         *rejection_position_mask.shape,
@@ -1833,7 +2019,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
             # backend exposes the two sums separately for exact distributed
             # normalization; averaging these local CE means would be biased.
             loss = loss + self.first_rejection_ce_alpha * (
-                local_first_ce_sum / local_first_ce_count.clamp(min=1.0)
+                local_first_ce_sum / local_first_ce_weight_sum.clamp(min=1.0)
+            )
+        if self.rejected_aux_alpha > 0:
+            loss = loss + self.rejected_aux_alpha * (
+                local_rejected_k3_sum / local_rejected_k3_den.clamp(min=1.0)
             )
 
         with torch.no_grad():
@@ -2004,6 +2194,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "first_rejection_ce_alpha": local_ce_den.new_tensor(self.first_rejection_ce_alpha),
             "first_rejection_ce_loss_sum": local_first_ce_sum.detach(),
             "first_rejection_ce_token_count": local_first_ce_count.detach(),
+            "first_rejection_ce_weight_sum": local_first_ce_weight_sum.detach(),
+            "first_rejection_ce_boosted_count": local_first_ce_boosted_count.detach(),
             "first_rejection_ce_q_prob_sum": local_first_ce_q_sum.detach(),
             "l1_loss_sum": local_l1_sum.detach(),
             "l1_weighted_token_count": local_l1_den.detach(),
@@ -2064,6 +2256,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "rejected_stream_weight_multiplier": (
                 rejected_stream_weight_multiplier.detach()
             ),
+            "rejected_aux_alpha": local_ce_den.new_tensor(self.rejected_aux_alpha),
+            "rejected_prefix_length": local_ce_den.new_tensor(
+                float(self.rejected_prefix_length)
+            ),
             "metric_replica_count": torch.ones(
                 (), dtype=torch.float32, device=device
             ),
@@ -2108,11 +2304,24 @@ class DSparkTrainingModel(DFlashTrainingModel):
         }
         if self.dump_k3_logprobs:
             diagnostics["k3_logprob_dump"] = k3_dump_payload
-        if self.first_rejection_ce_alpha > 0:
+        if os.getenv("SPECO_DRAFTER_STATE_DIAGNOSTICS_DIR"):
+            diagnostics["state_probe"] = {
+                "context_feature": context_feature.detach(),
+                "draft_hidden": draft_hidden.detach(),
+                "context_position_ids": context_position_ids.detach(),
+                "draft_position_ids": draft_position_ids.detach(),
+                "anchor_positions": anchor_positions.detach(),
+                "block_keep_mask": block_keep_mask.detach(),
+                "noise_embedding": noise_embedding.detach(),
+            }
+        if self.first_rejection_ce_alpha > 0 or self.rejected_aux_alpha > 0:
             # These private tensors intentionally retain autograd until the
             # backend has separated the base and auxiliary loss numerators.
             diagnostics["_base_loss"] = base_loss
-            diagnostics["_first_rejection_ce_loss_sum"] = local_first_ce_sum
+            if self.first_rejection_ce_alpha > 0:
+                diagnostics["_first_rejection_ce_loss_sum"] = local_first_ce_sum
+            if self.rejected_aux_alpha > 0:
+                diagnostics["_rejected_aux_loss_sum"] = local_rejected_k3_sum
         return (
             loss,
             accuracy,
@@ -2360,6 +2569,15 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             first_rejection_ce_alpha=float(
                 training_cfg.get("dspark_first_rejection_ce_alpha", 0.0)
             ),
+            first_rejection_ce_low_entropy_multiplier=float(
+                training_cfg.get("dspark_first_rejection_ce_low_entropy_multiplier", 1.0)
+            ),
+            first_rejection_ce_low_entropy_threshold=float(
+                training_cfg.get("dspark_first_rejection_ce_low_entropy_threshold", 0.01)
+            ),
+            first_rejection_ce_max_rejected_logprob=float(
+                training_cfg.get("dspark_first_rejection_ce_max_rejected_logprob", -4.0)
+            ),
             l1_loss_alpha=float(
                 training_cfg.get(
                     "dspark_l1_loss_alpha",
@@ -2377,6 +2595,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             ),
             rejected_k3_alpha=float(
                 training_cfg.get("dspark_rejected_k3_alpha", 1.0)
+            ),
+            rejected_aux_alpha=float(
+                training_cfg.get("dspark_rejected_aux_alpha", 0.0)
+            ),
+            rejected_prefix_length=int(
+                training_cfg.get("dspark_rejected_prefix_length", 0)
             ),
             response_loss=str(training_cfg.get("dspark_response_loss", "k3")),
             rejected_loss=str(training_cfg.get("dspark_rejected_loss", "k3")),
@@ -2467,6 +2691,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             "trace_draft_token_ids": [],
             "trace_draft_teacher_logprobs": [],
             "trace_draft_teacher_logprob_mask": [],
+            "trace_first_rejection_teacher_entropies": [],
             "trace_bonus_response_anchor_mask": [],
         }
         max_window = int(
@@ -2516,6 +2741,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         )
 
         for item in items:
+            if (float(training_cfg.get("dspark_certainty_share_threshold", 0.0)) > 0
+                    and "low_entropy_sampling_active" not in item):
+                raise ValueError("Certainty-gated training is missing its collection-time sampling flag")
             layout = item.get("hidden_states_layout")
             if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
                 raise ValueError(
@@ -2597,15 +2825,51 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             trace_block_size = int(
                 self.config.rollout.drafter.training.get("dspark_block_size", 7)
             )
+            directional_probe = bool(item.get("_speco_directional_probe", False))
+            selected_anchors = item.get("_speco_directional_selected_anchors")
             trace_rows = _trace_anchor_rows_for_item(
                 item,
                 crop_start=int(start),
                 crop_end=int(end),
-                num_anchors=self.config.rollout.drafter.training.get(
-                    "dspark_num_anchors", 512
+                num_anchors=(
+                    int(training_cfg.get("dspark_directional_probe_anchors", 128))
+                    if directional_probe or selected_anchors is not None
+                    else self.config.rollout.drafter.training.get("dspark_num_anchors", 512)
                 ),
                 block_size=trace_block_size,
+                low_entropy_fraction=(
+                    0.0 if (item.get("_speco_fixed_eval_holdout", False)
+                            or not item.get("low_entropy_sampling_active", True))
+                    else float(training_cfg.get("dspark_low_entropy_anchor_fraction", 0.0))
+                ),
+                low_entropy_threshold=float(training_cfg.get("dspark_low_entropy_threshold", 0.01)),
+                position_stratified_low_entropy=bool(training_cfg.get(
+                    "dspark_position_entropy_stratified_sampling_enabled", False
+                )),
+                require_rejected_logprob=bool(item.get("_speco_sampling_require_strict_rejection", False)),
+                low_entropy_max_rejected_logprob=float(training_cfg.get(
+                    "dspark_low_entropy_max_rejected_logprob", -4.0
+                )),
+                selection_stats=(selection_stats := {}),
+                forced_reserved_anchors=item.get("_speco_global_reserved_trace_anchors"),
             )
+            if selected_anchors is not None:
+                selected_set = {int(anchor) for anchor in selected_anchors}
+                available = {int(row["anchor"]) for row in trace_rows}
+                if not selected_set <= available:
+                    raise ValueError("Directional training anchors differ from the paired probe")
+                trace_rows = [
+                    row for row in trace_rows if int(row["anchor"]) in selected_set
+                ]
+            if float(training_cfg.get("dspark_low_entropy_anchor_fraction", 0.0)) > 0:
+                if selection_stats.get("rejections", 0) and not selection_stats.get("entropy_observed", 0):
+                    raise ValueError("Low-entropy anchor sampling requires draft_teacher_entropies in verify traces")
+                logger.info(
+                    "[dspark low-entropy sampling] step=%s sample=%s fixed_eval=%s gate_active=%s stats=%s",
+                    item.get("global_step"), item.get("sample_id"),
+                    bool(item.get("_speco_fixed_eval_holdout", False)),
+                    bool(item.get("low_entropy_sampling_active", True)), selection_stats,
+                )
 
             res["ids"].append(ids[start:end])
             res["h_states"].append(full_h[start:end, :expected_hidden_dim])
@@ -2725,6 +2989,17 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                     device=device,
                 ).reshape(-1, trace_block_size)
             )
+            res["trace_first_rejection_teacher_entropies"].append(
+                torch.tensor(
+                    [
+                        row.get("first_rejection_entropy")
+                        if row.get("first_rejection_entropy") is not None else float("nan")
+                        for row in trace_rows
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
@@ -2759,6 +3034,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             trace_draft_teacher_logprob_mask=batch.get(
                 "trace_draft_teacher_logprob_mask"
             ),
+            trace_first_rejection_teacher_entropies=batch.get(
+                "trace_first_rejection_teacher_entropies"
+            ),
             trace_bonus_response_anchor_mask=batch.get(
                 "trace_bonus_response_anchor_mask"
             ),
@@ -2776,7 +3054,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             local_num_tokens = count_pp.sum()
         local_num_tokens = local_num_tokens.to(loss.device, dtype=loss.dtype)
         base_loss = diagnostics.pop("_base_loss", loss)
-        auxiliary_sum = diagnostics.pop("_first_rejection_ce_loss_sum", None)
+        first_ce_auxiliary_sum = diagnostics.pop(
+            "_first_rejection_ce_loss_sum", None
+        )
+        rejected_auxiliary_sum = diagnostics.pop("_rejected_aux_loss_sum", None)
         result = {
             "total_local_vloss": torch.tensor(0.0, device=batch["input_ids"].device),
             "total_local_ploss": base_loss * local_num_tokens,
@@ -2792,9 +3073,24 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 for key, value in diagnostics.items()
             },
         }
-        if auxiliary_sum is not None:
-            result["auxiliary_loss"] = {
-                "loss_sum": auxiliary_sum * draft_model.first_rejection_ce_alpha,
-                "token_count": diagnostics["first_rejection_ce_token_count"],
-            }
+        auxiliary_losses = []
+        if first_ce_auxiliary_sum is not None:
+            auxiliary_losses.append({
+                "name": "first_rejection_ce",
+                "loss_sum": (
+                    first_ce_auxiliary_sum * draft_model.first_rejection_ce_alpha
+                ),
+                "token_count": diagnostics["first_rejection_ce_weight_sum"],
+            })
+        if rejected_auxiliary_sum is not None:
+            auxiliary_losses.append({
+                "name": "rejected_k3",
+                "loss_sum": rejected_auxiliary_sum * draft_model.rejected_aux_alpha,
+                "token_count": diagnostics["rejected_k3_weighted_count"],
+            })
+        if len(auxiliary_losses) == 1:
+            # Preserve the established one-auxiliary contract for callers and tests.
+            result["auxiliary_loss"] = auxiliary_losses[0]
+        elif auxiliary_losses:
+            result["auxiliary_losses"] = auxiliary_losses
         return result

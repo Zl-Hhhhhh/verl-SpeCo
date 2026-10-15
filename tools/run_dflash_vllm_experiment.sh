@@ -12,7 +12,7 @@ set -euo pipefail
 #   taco_taco: 2048 prompt / 4096 response, frequent small validation; useful for code-reward smoke tests.
 #   taco_lcb: 2048 / 4096, validates on LCB v6-only every 10 steps; use SANDBOX_FUSION_URL when available.
 #   taco_lcb_full: 2048 / 4096, intended for trainer.val_only=True final evaluation, not frequent validation.
-#   wildsci_gpqa: 4096 / 2048, validates every 10 steps; 4096 retains GPQA's single long prompt.
+#   wildsci_gpqa: 3072 prompt / 4096 response, validates every 10 steps and retains all GPQA questions.
 #   wildsci_mmlu: 2048 / 2048, validates every 50 steps because the test split has 5,878 questions.
 # Profile defaults can be overridden with MAX_PROMPT_LENGTH, MAX_RESPONSE_LENGTH, TEST_FREQ,
 # VAL_BEFORE_TRAIN, TRAIN_FILE, or TEST_FILE. For code OOM, try MAX_NUM_SEQS=128 before truncating prompts.

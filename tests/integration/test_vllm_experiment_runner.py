@@ -15,13 +15,95 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _start_mock_vllm_process(
+    name: str, token: str, *, ignore_term: bool = False
+) -> subprocess.Popen:
+    code = """
+import ctypes
+import signal
+import sys
+import time
+
+ctypes.CDLL(None).prctl(15, sys.argv[1].encode(), 0, 0, 0)
+if sys.argv[2] == "ignore-term":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+"""
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            code,
+            name,
+            "ignore-term" if ignore_term else "handle-term",
+        ],
+        env={**os.environ, "SPECO_RUN_CLEANUP_ID": token},
+    )
+
+
+def _wait_for_process_name(process: subprocess.Popen, name: str) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if Path(f"/proc/{process.pid}/comm").read_text().strip() == name[:15]:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"process {process.pid} did not set its name")
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_vllm_cleanup_only_stops_processes_owned_by_this_run(ignore_term: bool) -> None:
+    token = str(uuid.uuid4())
+    owned = _start_mock_vllm_process(
+        "VLLM::EngineCore", token, ignore_term=ignore_term
+    )
+    worker = _start_mock_vllm_process("VLLM::Worker_TP0", token)
+    other_run = _start_mock_vllm_process("VLLM::EngineCore", str(uuid.uuid4()))
+    other_process = _start_mock_vllm_process("unrelated", token)
+    processes = (owned, worker, other_run, other_process)
+    try:
+        names = ("VLLM::EngineCore", "VLLM::Worker_TP0", "VLLM::EngineCore", "unrelated")
+        for process, name in zip(processes, names):
+            _wait_for_process_name(process, name)
+        command = f"""
+set -euo pipefail
+source {ROOT / 'tools' / 'speco_vllm_experiment_common.sh'}
+SPECO_RUN_CLEANUP_ID={token}
+SPECO_RETENTION_PID=
+SPECO_RAY_COMMAND=()
+"""
+        if ignore_term:
+            command += "sleep() { :; }\n"
+        result = subprocess.run(
+            ["bash", "-c", command + "speco_cleanup_experiment\n"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        owned.wait(timeout=3)
+        worker.wait(timeout=3)
+        assert other_run.poll() is None
+        assert other_process.poll() is None
+        if ignore_term:
+            assert "forcing" in result.stderr
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
 
 
 def _run_dflash(
@@ -377,7 +459,7 @@ def test_managed_dflash_rejects_an_undersized_visible_mask(tmp_path: Path) -> No
             "wildsci_gpqa",
             "/workspace/data/drafter_domains/verl/science/wildsci_all_aligned/train.parquet",
             "/workspace/data/drafter_domains/verl/science/eval/gpqa_diamond/test.parquet",
-            "sequence=max_prompt=2048 max_response=4096 test_freq=10 val_before_train=True",
+            "sequence=max_prompt=3072 max_response=4096 test_freq=10 val_before_train=True",
         ),
         (
             "wildsci_mmlu",
@@ -668,6 +750,32 @@ def test_retention_keeps_drafter_checkpoint_used_at_process_start(
         assert checkpoint_root.joinpath("drafter", "draft_step_48").is_dir()
         assert checkpoint_root.joinpath("drafter", "draft_step_49").is_dir()
         assert checkpoint_root.joinpath("drafter", "draft_step_52").is_dir()
+    finally:
+        sentinel.touch()
+        process.wait(timeout=3)
+
+
+def test_retention_preserves_explicit_actor_and_drafter_steps(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    for step in (40, 50, 60):
+        _write_complete_checkpoint(checkpoint_root, step)
+    (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("60\n")
+    sentinel = tmp_path / "done"
+    process = subprocess.Popen(
+        [str(ROOT / "tools" / "watch_checkpoint_retention.sh"),
+         str(checkpoint_root), str(sentinel), "0.05"],
+        env={**os.environ, "SPECO_PROTECTED_ACTOR_STEPS": "50,60",
+             "SPECO_PROTECTED_DRAFTER_STEPS": "50,60"},
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while (checkpoint_root / "drafter" / "draft_step_40").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not (checkpoint_root / "global_step_40").exists()
+        assert not (checkpoint_root / "drafter" / "draft_step_40").exists()
+        for step in (50, 60):
+            assert (checkpoint_root / f"global_step_{step}" / "actor").is_dir()
+            assert (checkpoint_root / "drafter" / f"draft_step_{step}").is_dir()
     finally:
         sentinel.touch()
         process.wait(timeout=3)

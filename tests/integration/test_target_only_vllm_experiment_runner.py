@@ -93,4 +93,4 @@ def test_target_only_uses_the_same_dataset_profile_defaults(tmp_path: Path) -> N
         "name=target_only_150step"
         in result.stdout
     )
-    assert "max_prompt=2048 max_response=4096" in result.stdout
+    assert "max_prompt=3072 max_response=4096" in result.stdout

@@ -420,6 +420,47 @@ def test_checkpoint_offset_hook_saves_shifted_steps_and_restores_config() -> Non
     assert saved_steps == [11, 21]
 
 
+@pytest.mark.parametrize('loaded_step', [1, 41])
+def test_entropy_lr_preflight_runs_before_upstream_initializes_step(monkeypatch, tmp_path, loaded_step):
+    from verl.utils.dataset.rl_dataset import collate_fn
+
+    trainer = _trainer({'entropy_lr_enabled': True, 'candidate_gate_enabled': True,
+                        'lr_scheduler_type': 'constant'})
+    del trainer.global_steps  # This attribute does not exist before RayPPOTrainer.fit.
+    trainer.config.trainer = OmegaConf.create({'default_local_dir': str(tmp_path), 'resume_mode': 'disable'})
+    trainer.tokenizer = SimpleNamespace(eos_token_id=2, pad_token_id=0)
+    trainer.val_dataloader = [collate_fn([
+        {'dummy_tensor': torch.tensor([0]), 'raw_prompt': [{'role': 'user', 'content': str(i)}]}
+        for i in range(30)])]
+    trainer._speco_checkpoint_offset_hook = lambda: nullcontext()
+    trainer._speco_tracking_metrics_hook = lambda: nullcontext()
+    trainer._speco_online_fit_hooks = lambda: nullcontext()
+
+    def activate():
+        assert not hasattr(trainer, 'global_steps')
+        assert len(trainer._speco_entropy_lr().cohort) == 30
+
+    trainer._speco_activate_drafter_training_model_before_fit = activate
+    trainer._speco_wait_pending_drafter_checkpoint = lambda: None
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: None
+    trainer._speco_mark_final_drafter_checkpoint = lambda: None
+
+    def upstream_fit(self):
+        assert not hasattr(self, 'global_steps')
+        self.global_steps = loaded_step
+        batch = self._speco_entropy_lr().validation_batch(32)
+        assert batch.meta_info['global_steps'] == loaded_step
+        self.global_steps += 5
+        next_batch = self._speco_entropy_lr().validation_batch(32)
+        assert next_batch.meta_info['global_steps'] == loaded_step + 5
+        assert batch.meta_info['global_steps'] == loaded_step
+        assert batch.non_tensor_batch['uid'].tolist() == next_batch.non_tensor_batch['uid'].tolist()
+        return 'finished'
+
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, 'fit', upstream_fit)
+    assert trainer.fit() == 'finished'
+
+
 def test_successful_fit_saves_terminal_drafter_checkpoint(monkeypatch) -> None:
     trainer = _trainer({"save_full_drafter_checkpoint": True}, step=100)
     events = []
@@ -429,7 +470,7 @@ def test_successful_fit_saves_terminal_drafter_checkpoint(monkeypatch) -> None:
     trainer._speco_activate_drafter_training_model_before_fit = lambda: None
     trainer._speco_wait_pending_drafter_checkpoint = lambda: events.append("wait")
     trainer._speco_save_drafter_checkpoint = (
-        lambda *, wait=True: events.append(("save", trainer.global_steps, wait))
+        lambda *, wait=True, step=None: events.append(("save", step, wait))
     )
     trainer._speco_mark_final_drafter_checkpoint = lambda: events.append("mark")
     monkeypatch.setattr(
@@ -440,6 +481,31 @@ def test_successful_fit_saves_terminal_drafter_checkpoint(monkeypatch) -> None:
 
     assert trainer.fit() == "finished"
     assert events == ["fit", "wait", ("save", 100, True), "mark"]
+
+
+@pytest.mark.parametrize("previous_saved_step", [50, 60])
+def test_terminal_drafter_uses_completed_step_after_verl_increment(monkeypatch, tmp_path, previous_saved_step):
+    trainer = _trainer({"save_full_drafter_checkpoint": True}, step=60)
+    trainer.total_training_steps = 60
+    trainer._speco_last_saved_drafter_step = previous_saved_step
+    trainer._speco_checkpoint_offset_hook = lambda: nullcontext()
+    trainer._speco_tracking_metrics_hook = lambda: nullcontext()
+    trainer._speco_online_fit_hooks = lambda: nullcontext()
+    trainer._speco_activate_drafter_training_model_before_fit = lambda: None
+    trainer._speco_wait_pending_drafter_checkpoint = lambda: None
+    trainer._speco_should_save_drafter_checkpoint = lambda: True
+    trainer._speco_ensure_drafter_checkpoint_path = lambda: str(tmp_path)
+    saved = []
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: saved.append(kwargs["step"])
+
+    def finish(self):
+        self.global_steps += 1
+        return "finished"
+
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, "fit", finish)
+    assert trainer.fit() == "finished"
+    assert saved == ([60] if previous_saved_step == 50 else [])
+    assert (tmp_path / "final_checkpointed_iteration.txt").read_text() == "60\n"
 
 
 def test_failed_fit_does_not_mark_drafter_as_final(monkeypatch) -> None:
@@ -822,6 +888,30 @@ def test_rollout_metrics_hook_collects_validation_without_training_metrics() -> 
     assert not hasattr(trainer, "_speco_last_rollout_metrics")
 
 
+def test_rollout_metrics_hook_captures_validation_entropy_when_enabled(monkeypatch) -> None:
+    class FakeRolloutManager:
+        def generate_sequences(self, batch):
+            del batch
+            return SimpleNamespace(
+                batch={"response_mask": torch.ones((1, 1), dtype=torch.long)},
+                non_tensor_batch={},
+                meta_info={"validate": True},
+            )
+
+    trainer = _trainer({}, step=100)
+    trainer.async_rollout_manager = FakeRolloutManager()
+    captured = []
+    trainer._speco_save_actor_verify_entropy = captured.append
+    monkeypatch.setenv("SPECO_CAPTURE_VALIDATION_VERIFY_ENTROPY", "true")
+
+    with trainer._speco_rollout_metrics_fit_hook():
+        output = trainer.async_rollout_manager.generate_sequences(
+            SimpleNamespace(meta_info={"validate": True})
+        )
+
+    assert captured == [output]
+
+
 def test_rollout_metrics_hook_collects_training_effective_throughput() -> None:
     class FakeRolloutManager:
         def generate_sequences(self, batch):
@@ -850,6 +940,29 @@ def test_rollout_metrics_hook_collects_training_effective_throughput() -> None:
     assert quality["response_tokens"] == 6.0
     assert quality["generation_time_s"] > 0.0
     assert quality["response_tokens_per_second"] > 0.0
+
+
+def test_verification_entropy_rollout_accumulates_and_resets_per_step() -> None:
+    trainer = _trainer({}, step=7)
+    def output(entropies, accepted):
+        return SimpleNamespace(
+            batch={"response_mask": torch.ones((1, 1), dtype=torch.long)},
+            non_tensor_batch={_speco_ray_trainer.SPECO_VLLM_SPECULATIVE_TRACE_KEY: [[{
+                "draft_count": len(entropies), "accepted_count": accepted,
+                "draft_teacher_entropies": entropies,
+            }]]},
+        )
+    trainer._speco_store_rollout_metrics(output([1.0, 2.0], 2), 1.0)
+    trainer._speco_store_rollout_metrics(output([0.0, 99.0], 0), 1.0)
+    metrics = trainer._speco_current_step_rollout_metrics()
+    assert metrics["actor/verify_entropy"] == 1.0
+    assert metrics["actor/verify_entropy_positions"] == 3
+    trainer.global_steps = 8
+    assert trainer._speco_current_step_rollout_metrics() == {}
+    trainer._speco_store_rollout_metrics(output([0.25], 0), 1.0)
+    metrics = trainer._speco_current_step_rollout_metrics()
+    assert metrics["actor/verify_entropy"] == 0.25
+    assert metrics["actor/verify_entropy_positions"] == 1
 
 
 def test_online_hook_records_training_rollout_quality() -> None:
@@ -885,6 +998,49 @@ def test_online_hook_records_training_rollout_quality() -> None:
     assert quality["response_tokens"] == 4.0
     assert quality["generation_time_s"] > 0.0
     assert quality["response_tokens_per_second"] > 0.0
+
+
+def test_entropy_lr_resolves_candidate_before_checkpoint_and_syncs_actor_once():
+    trainer = _trainer({'candidate_gate_enabled': True, 'entropy_lr_enabled': True}, step=5)
+    events = []
+    trainer.async_rollout_manager = SimpleNamespace(generate_sequences=lambda batch: batch)
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda step: events.append('actor_sync'))
+    trainer._compute_old_log_prob = lambda batch: batch
+    trainer._update_actor = lambda batch: events.append('actor_update') or batch
+    trainer._speco_pending_candidate_update = None
+    trainer._speco_pending_candidate_metrics = {}
+    trainer._speco_pending_best_candidate_save = None
+    trainer._speco_wait_pending_drafter_publish = lambda: None
+    trainer._speco_should_train_drafter_this_step = lambda: True
+    trainer._speco_should_attempt_drafter_train_this_step = lambda: True
+    trainer._speco_oldlogprob_collection_requested = lambda: False
+    trainer._speco_maybe_save_dual_best_from_rollout = lambda: {}
+    trainer._speco_check_post_update_acceptance_guard = lambda: {}
+    trainer._speco_set_drafter_global_step = lambda: None
+    trainer._speco_sync_target_lm_head_weight = lambda: {}
+    trainer._speco_train_drafter = lambda: (True, {})
+    trainer._speco_arm_post_update_acceptance_guard = lambda metrics: {}
+
+    def stage(*args):
+        trainer._speco_pending_candidate_update = {'step': 5}
+        return {}
+
+    def validate(*args):
+        assert events == ['actor_update', 'actor_sync']
+        events.append('validation_finalize')
+        trainer._speco_pending_candidate_update = None
+        return {'drafter/candidate/committed': 1}
+
+    trainer._speco_stage_candidate_update = stage
+    trainer._speco_entropy_lr = lambda: SimpleNamespace(validate=validate)
+    with trainer._speco_online_fit_hooks():
+        trainer._update_actor(SimpleNamespace(meta_info={'metrics': {}}))
+        assert trainer._speco_pending_candidate_update is None
+        events.append('checkpoint')  # Upstream saves immediately after actor update.
+        trainer.checkpoint_manager.update_weights(5)
+        assert events == ['actor_update', 'actor_sync', 'validation_finalize', 'checkpoint']
+        trainer.checkpoint_manager.update_weights(6)
+        assert events[-1] == 'actor_sync'  # Skip only the synchronization already done.
 
 
 def test_dual_best_uses_step_101_rollout_to_save_step_100_once(
@@ -1325,6 +1481,27 @@ def test_actor_checkpoint_failure_preserves_previous_drafter(monkeypatch) -> Non
         ("drafter", {"wait": True}),
         ("actor", {}),
     ]
+
+
+def test_tracking_hook_logs_real_verification_entropy(monkeypatch) -> None:
+    from verl.utils.tracking import Tracking
+
+    trainer = _trainer({}, step=7)
+    trainer._speco_last_rollout_metrics_step = 7
+    trainer._speco_last_rollout_metrics = {}
+    trainer._speco_last_rollout_verify_entropy_stats = {"count": 2, "sum": 0.6}
+    logged = []
+    backend = SimpleNamespace(log=lambda **kwargs: logged.append(kwargs))
+
+    def initialize(tracking_self, *args, **kwargs):
+        tracking_self.logger = {"console": backend}
+
+    monkeypatch.setattr(Tracking, "__init__", initialize)
+    with trainer._speco_tracking_metrics_hook():
+        tracking = Tracking("project", "experiment")
+        tracking.log(data={"training/global_step": 7, "actor/entropy": 0.0}, step=7)
+    assert logged[0]["data"]["actor/verify_entropy"] == pytest.approx(0.3)
+    assert logged[0]["data"]["actor/entropy"] == 0.0
 
 
 @pytest.mark.parametrize(("raises", "expected_exit_code"), [(False, 0), (True, 1)])

@@ -535,6 +535,60 @@ speco_configure_ray_command() {
     speco_die "Ray CLI is unavailable for Python environment: ${python_bin}" || return 1
 }
 
+speco_is_owned_vllm_process() {
+    local pid=$1
+    local process_name entry
+    [[ -n "${SPECO_RUN_CLEANUP_ID:-}" && -r "/proc/${pid}/comm" && -r "/proc/${pid}/environ" ]] || return 1
+    IFS= read -r process_name < "/proc/${pid}/comm" 2>/dev/null || return 1
+    case "${process_name}" in
+        VLLM::Engine* | VLLM::Worker*) ;;
+        *) return 1 ;;
+    esac
+    while IFS= read -r -d '' entry; do
+        [[ "${entry}" == "SPECO_RUN_CLEANUP_ID=${SPECO_RUN_CLEANUP_ID}" ]] && return 0
+    done < "/proc/${pid}/environ" 2>/dev/null
+    return 1
+}
+
+speco_owned_vllm_pids() {
+    local proc pid
+    for proc in /proc/[0-9]*/comm; do
+        pid=${proc%/comm}
+        pid=${pid##*/}
+        if speco_is_owned_vllm_process "${pid}"; then
+            printf '%s\n' "${pid}"
+        fi
+    done
+}
+
+speco_cleanup_vllm_children() {
+    [[ -n "${SPECO_RUN_CLEANUP_ID:-}" ]] || return 0
+    local pid attempt
+    local -a pids=()
+    mapfile -t pids < <(speco_owned_vllm_pids)
+    (( ${#pids[@]} > 0 )) || return 0
+    echo "Stopping ${#pids[@]} remaining vLLM processes from this run" >&2
+    for pid in "${pids[@]}"; do
+        if speco_is_owned_vllm_process "${pid}"; then
+            kill -TERM "${pid}" 2>/dev/null || true
+        fi
+    done
+    for ((attempt = 0; attempt < 10; attempt++)); do
+        mapfile -t pids < <(speco_owned_vllm_pids)
+        (( ${#pids[@]} > 0 )) || return 0
+        sleep 1
+    done
+    echo "Warning: forcing ${#pids[@]} remaining vLLM processes to exit" >&2
+    for pid in "${pids[@]}"; do
+        if speco_is_owned_vllm_process "${pid}"; then
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    done
+    sleep 1
+    mapfile -t pids < <(speco_owned_vllm_pids)
+    (( ${#pids[@]} == 0 )) || echo "Warning: vLLM processes still present: ${pids[*]}" >&2
+}
+
 speco_cleanup_experiment() {
     if [[ -n "${SPECO_RETENTION_PID}" ]]; then
         kill "${SPECO_RETENTION_PID}" >/dev/null 2>&1 || true
@@ -544,6 +598,7 @@ speco_cleanup_experiment() {
     if (( ${#SPECO_RAY_COMMAND[@]} > 0 )) && ! speco_is_true "${SPECO_SKIP_GLOBAL_RAY_STOP:-0}"; then
         "${SPECO_RAY_COMMAND[@]}" stop --force >/dev/null 2>&1 || true
     fi
+    speco_cleanup_vllm_children
 }
 
 speco_run_vllm_experiment() {
@@ -559,7 +614,7 @@ speco_run_vllm_experiment() {
 
     # Dataset profiles keep train/eval separation and length limits consistent.
     # Explicit environment variables still override every profile default.
-    local dataset_profile=${DATASET_PROFILE:-dapo}
+    local dataset_profile=${DATASET_PROFILE:-taco_taco}
     dataset_profile=${dataset_profile,,}
     dataset_profile=${dataset_profile//-/_}
     local dataset_train_default
@@ -740,7 +795,7 @@ speco_run_vllm_experiment() {
     local draft_publish_interval=${DRAFT_PUBLISH_INTERVAL_STEPS:-0}
     local draft_batch_size=${DRAFT_BATCH_SIZE_PER_GPU:-4}
     local draft_train_batches=${DRAFT_TRAIN_BATCHES_PER_CYCLE:-${default_draft_train_batches}}
-    local draft_max_samples=${DRAFT_MAX_COLLECT_SAMPLES_PER_REPLICA:-32}
+    local draft_max_samples=${DRAFT_MAX_COLLECT_SAMPLES_PER_REPLICA:-20}
     local draft_lr=${DRAFT_LR:-${default_draft_lr}}
     local draft_lr_scheduler=${DRAFT_LR_SCHEDULER_TYPE:-$([[ ${strong_checkpoint_init} == 1 ]] && echo global_cosine || echo constant)}
     local draft_lr_warmup_steps=${DRAFT_LR_WARMUP_STEPS:-$([[ ${strong_checkpoint_init} == 1 ]] && echo 2 || echo 0)}
@@ -783,7 +838,7 @@ speco_run_vllm_experiment() {
     local dspark_rejected_position_decay=${DSPARK_REJECTED_POSITION_DECAY:-0.8}
     local dspark_rejected_log_ratio_clamp=${DSPARK_REJECTED_LOG_RATIO_CLAMP:-20.0}
     local dspark_rejected_loss_max_clamp=${DSPARK_REJECTED_LOSS_MAX_CLAMP:-10.0}
-    local dspark_asymmetric_k3_enabled=${DSPARK_ASYMMETRIC_K3_ENABLED:-true}
+    local dspark_asymmetric_k3_enabled=${DSPARK_ASYMMETRIC_K3_ENABLED:-false}
     local dspark_accepted_asymmetric_k3_enabled=${DSPARK_ACCEPTED_ASYMMETRIC_K3_ENABLED:-${dspark_asymmetric_k3_enabled}}
     local dspark_rejected_asymmetric_k3_enabled=${DSPARK_REJECTED_ASYMMETRIC_K3_ENABLED:-${dspark_asymmetric_k3_enabled}}
     local dspark_asymmetric_k3_positive_threshold=${DSPARK_ASYMMETRIC_K3_POSITIVE_THRESHOLD:-2.0}
@@ -1305,6 +1360,9 @@ PY
     export MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2}
 
     speco_configure_ray_command "${experiment_python}" || return 1
+    IFS= read -r SPECO_RUN_CLEANUP_ID < /proc/sys/kernel/random/uuid \
+        || { speco_die "cannot create a vLLM cleanup identifier"; return 1; }
+    export SPECO_RUN_CLEANUP_ID
     trap speco_cleanup_experiment EXIT INT TERM
     if ! speco_is_true "${SPECO_SKIP_GLOBAL_RAY_STOP:-0}"; then
         "${SPECO_RAY_COMMAND[@]}" stop --force >/dev/null 2>&1 || true

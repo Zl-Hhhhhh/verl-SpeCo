@@ -108,10 +108,13 @@ def _small_dspark_training_model(
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
     first_rejection_ce_alpha: float = 0.0,
+    first_rejection_ce_low_entropy_multiplier: float = 1.0,
     trace_aligned_anchors: bool = False,
     accepted_k3_alpha: float = 0.0,
     accepted_fkl_alpha: float = 0.0,
     rejected_k3_alpha: float = 0.0,
+    rejected_aux_alpha: float = 0.0,
+    rejected_prefix_length: int = 0,
     response_stream_weight: float = 1.0,
     rejected_stream_weight: float = 1.0,
     rejected_first_weight_multiplier: float = 1.0,
@@ -154,12 +157,17 @@ def _small_dspark_training_model(
         num_anchors=2,
         loss_mode=loss_mode,
         first_rejection_ce_alpha=first_rejection_ce_alpha,
+        first_rejection_ce_low_entropy_multiplier=(
+            first_rejection_ce_low_entropy_multiplier
+        ),
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
         trace_aligned_anchors=trace_aligned_anchors,
         accepted_k3_alpha=accepted_k3_alpha,
         accepted_fkl_alpha=accepted_fkl_alpha,
         rejected_k3_alpha=rejected_k3_alpha,
+        rejected_aux_alpha=rejected_aux_alpha,
+        rejected_prefix_length=rejected_prefix_length,
         response_stream_weight=response_stream_weight,
         rejected_stream_weight=rejected_stream_weight,
         rejected_first_weight_multiplier=rejected_first_weight_multiplier,
@@ -179,6 +187,41 @@ def _small_dspark_training_model(
         rejected_loss=rejected_loss,
         topk_support=topk_support,
     )
+
+
+def test_state_probe_preserves_loss_gradients_and_rng(monkeypatch, tmp_path):
+    torch.manual_seed(73)
+    model = _small_dspark_training_model(
+        block_size=2, trace_aligned_anchors=True, accepted_k3_alpha=1.,
+        rejected_k3_alpha=1., dump_k3_logprobs=True,
+    )
+    inputs = dict(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        hidden_states_list=[torch.randn(1, 3, 8), torch.randn(1, 3, 8)],
+        loss_mask=torch.ones(1, 3), lm_head_weight=torch.randn(32, 8),
+        target_last_hidden_states=torch.randn(1, 3, 8),
+        trace_anchor_positions=torch.tensor([[0]]), trace_anchor_mask=torch.tensor([[True]]),
+        trace_accepted_counts=torch.tensor([[1]]), trace_draft_counts=torch.tensor([[2]]),
+        trace_rejected_token_ids=torch.tensor([[12]]), trace_draft_token_ids=torch.tensor([[[2, 12]]]),
+        trace_draft_teacher_logprobs=torch.tensor([[[-.2, -2.]]]),
+        trace_draft_teacher_logprob_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+    )
+    monkeypatch.delenv("SPECO_DRAFTER_STATE_DIAGNOSTICS_DIR", raising=False)
+    baseline = model(**inputs)[0]
+    baseline.backward()
+    gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    rng = torch.random.get_rng_state().clone()
+    monkeypatch.setenv("SPECO_DRAFTER_STATE_DIAGNOSTICS_DIR", str(tmp_path))
+    loss, *_, diagnostics = model(**inputs)
+    loss.backward()
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert torch.equal(loss, baseline)
+    for name, p in model.named_parameters():
+        if name in gradients:
+            assert torch.equal(p.grad, gradients[name])
+    assert diagnostics["state_probe"]["context_feature"].shape[:2] == (1, 3)
+    assert not diagnostics["state_probe"]["draft_hidden"].requires_grad
 
 
 @pytest.mark.parametrize("response_loss,rejected_loss", [("k3", "k3"), ("topk", "k3"), ("k3", "topk"), ("topk", "topk")])
@@ -346,6 +389,160 @@ def test_first_rejection_ce_targets_only_correct_replacements_without_low_q_clam
     assert logits.grad[[1, 3, 4, 6, 7, 8]].abs().sum() == 0
 
 
+def test_weighted_first_rejection_ce_uses_both_gates_and_global_weight_sum(monkeypatch):
+    model = _small_dspark_training_model(
+        block_size=3, trace_aligned_anchors=True,
+        first_rejection_ce_alpha=0.1,
+        first_rejection_ce_low_entropy_multiplier=2.0,
+    )
+    inputs = _first_rejection_ce_inputs()
+    inputs["trace_first_rejection_teacher_entropies"] = torch.tensor(
+        [[0.005, 0.2], [0.005, float("nan")]]
+    )
+    inputs["trace_draft_teacher_logprobs"][0, 0, 0] = -5.0
+    inputs["trace_draft_teacher_logprobs"][0, 1, 1] = -5.0
+    inputs["trace_draft_teacher_logprobs"][1, 0, 2] = -2.0
+    logits = torch.randn(9, 32, requires_grad=True)
+    monkeypatch.setattr(model, "_full_vocab_logits", lambda *args: logits)
+    loss, *_, stats = model(**inputs)
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    ce = torch.nn.functional.cross_entropy(
+        reference_logits[[0, 2, 5]], torch.tensor([2, 6, 4]), reduction="none"
+    )
+    expected = 0.1 * (ce * torch.tensor([2.0, 1.0, 1.0])).sum() / 4
+    assert loss.item() == pytest.approx(expected.item(), abs=1e-6)
+    assert stats["first_rejection_ce_token_count"].item() == 3
+    assert stats["first_rejection_ce_weight_sum"].item() == 4
+    assert stats["first_rejection_ce_boosted_count"].item() == 1
+    loss.backward()
+    expected.backward()
+    assert torch.allclose(logits.grad, reference_logits.grad, atol=1e-7)
+
+    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
+    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=inputs["lm_head_weight"]))
+    batch = {k: v for k, v in inputs.items() if k not in ("lm_head_weight", "hidden_states_list")}
+    batch["hidden_states"] = torch.cat(inputs["hidden_states_list"], dim=-1)
+    auxiliary = backend.compute_loss(model, batch, 0)["auxiliary_loss"]
+    assert auxiliary["token_count"].item() == 4
+
+
+def test_weighted_first_rejection_ce_rejects_missing_verify_data():
+    model = _small_dspark_training_model(
+        block_size=3, trace_aligned_anchors=True,
+        first_rejection_ce_alpha=0.1,
+        first_rejection_ce_low_entropy_multiplier=2.0,
+    )
+    inputs = _first_rejection_ce_inputs()
+    with pytest.raises(ValueError, match="requires verify entropies"):
+        model(**inputs)
+    inputs["trace_first_rejection_teacher_entropies"] = torch.full((2, 2), float("nan"))
+    with pytest.raises(ValueError, match="requires finite entropy"):
+        model(**inputs)
+    inputs["trace_first_rejection_teacher_entropies"].fill_(0.005)
+    inputs["trace_draft_teacher_logprob_mask"][0, 0, 0] = False
+    with pytest.raises(ValueError, match="candidate logprob"):
+        model(**inputs)
+
+
+@pytest.mark.parametrize("prefix_length,expected", [(1, 3), (2, 5), (3, 6)])
+def test_rejected_auxiliary_uses_positions_relative_to_first_rejection(
+    prefix_length, expected
+):
+    torch.manual_seed(79)
+    model = _small_dspark_training_model(
+        block_size=3,
+        trace_aligned_anchors=True,
+        accepted_k3_alpha=1.0,
+        rejected_k3_alpha=0.0,
+        rejected_aux_alpha=0.02,
+        rejected_prefix_length=prefix_length,
+        dump_k3_logprobs=True,
+    )
+    inputs = _first_rejection_ce_inputs()
+    full_loss, *_, diagnostics = model(**inputs)
+    rejected = diagnostics["k3_logprob_dump"]["rejected"]
+    relative = rejected["draft_positions"] - rejected["trace_accepted_counts"]
+    assert len(relative) == expected
+    assert (relative >= 0).all() and (relative < prefix_length).all()
+    expected_auxiliary = (
+        0.02
+        * diagnostics["rejected_k3_sum"]
+        / diagnostics["rejected_k3_weighted_count"]
+    )
+    model.rejected_aux_alpha = 0.0
+    base_loss, *_ = model(**inputs)
+    model.rejected_aux_alpha = 0.02
+    assert full_loss.item() == pytest.approx(
+        (base_loss + expected_auxiliary).item(), abs=1e-6
+    )
+
+    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
+    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=inputs["lm_head_weight"]))
+    batch = {k: v for k, v in inputs.items() if k not in ("lm_head_weight", "hidden_states_list")}
+    batch["hidden_states"] = torch.cat(inputs["hidden_states_list"], dim=-1)
+    result = backend.compute_loss(model, batch, 0)
+    auxiliary = result["auxiliary_loss"]
+    assert auxiliary["name"] == "rejected_k3"
+    assert auxiliary["token_count"].item() == pytest.approx(
+        diagnostics["rejected_k3_weighted_count"].item()
+    )
+
+
+def test_first_ce_and_rejected_k3_are_separate_auxiliary_means():
+    model = _small_dspark_training_model(
+        block_size=3,
+        trace_aligned_anchors=True,
+        accepted_k3_alpha=1.0,
+        first_rejection_ce_alpha=0.1,
+        rejected_k3_alpha=0.0,
+        rejected_aux_alpha=0.02,
+        rejected_prefix_length=2,
+    )
+    inputs = _first_rejection_ce_inputs()
+    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
+    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=inputs["lm_head_weight"]))
+    batch = {k: v for k, v in inputs.items() if k not in ("lm_head_weight", "hidden_states_list")}
+    batch["hidden_states"] = torch.cat(inputs["hidden_states_list"], dim=-1)
+    result = backend.compute_loss(model, batch, 0)
+    assert "auxiliary_loss" not in result
+    assert [item["name"] for item in result["auxiliary_losses"]] == [
+        "first_rejection_ce", "rejected_k3"
+    ]
+
+
+@pytest.mark.parametrize("ce_alpha", [0.0, 0.1])
+@pytest.mark.parametrize("rejected_alpha", [0.0, 0.1])
+def test_accepted_fkl_factorial_keeps_auxiliary_means_independent(
+    ce_alpha, rejected_alpha
+):
+    torch.manual_seed(89)
+    model = _small_dspark_training_model(
+        block_size=3, trace_aligned_anchors=True, accepted_fkl_alpha=1.0,
+        accepted_k3_alpha=0.0, rejected_k3_alpha=0.0,
+        rejected_stream_weight=0.0, first_rejection_ce_alpha=ce_alpha,
+        rejected_aux_alpha=rejected_alpha,
+        rejected_prefix_length=3 if rejected_alpha else 0,
+    )
+    loss, *_, stats = model(**_first_rejection_ce_inputs())
+    expected = stats["accepted_fkl_sum"] / stats["objective_weighted_token_count"]
+    if ce_alpha:
+        expected = expected + ce_alpha * stats["first_rejection_ce_loss_sum"] / stats[
+            "first_rejection_ce_token_count"
+        ]
+    if rejected_alpha:
+        expected = expected + rejected_alpha * stats["rejected_k3_sum"] / stats[
+            "rejected_k3_weighted_count"
+        ]
+        assert stats["rejected_k3_weighted_count"].item() > 0
+    else:
+        assert stats["rejected_k3_weighted_count"].item() == 0
+    assert loss.item() == pytest.approx(expected.item(), abs=1e-6)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters()
+               if parameter.grad is not None)
+
+
 @pytest.mark.parametrize("loss_mode", ["full_vocab", "chunked_ce"])
 @pytest.mark.parametrize("all_accepted", [False, True])
 def test_first_rejection_ce_backend_keeps_base_objective_and_separate_mean(loss_mode, all_accepted):
@@ -427,6 +624,7 @@ def test_topk_candidates_survive_crop_filter_and_padded_training_batch(support):
     event = {
         "response_start": 0, "draft_count": 2, "accepted_count": 0,
         "draft_token_ids": [2, 16], "draft_teacher_logprobs": [-2., -3.],
+        "draft_teacher_entropies": [0.005, 0.2],
         "draft_topk_ids": candidate_ids,
         "draft_topk_teacher_logprobs": [[-4.] * width, [-5.] * width],
     }
@@ -451,6 +649,9 @@ def test_topk_candidates_survive_crop_filter_and_padded_training_batch(support):
     trainer.rank = 0
     batch = trainer._prepare_training_batch(items_override=[item, skipped, longer], track_sample_usage=False)
     assert batch["trace_draft_topk_ids"].shape == (2, 2, 2, width)
+    assert batch["trace_first_rejection_teacher_entropies"].shape == (2, 2)
+    assert batch["trace_first_rejection_teacher_entropies"][0, 0].item() == pytest.approx(0.005)
+    assert torch.isnan(batch["trace_first_rejection_teacher_entropies"][0, 1])
     assert batch["trace_draft_topk_ids"][0, 0].tolist() == candidate_ids
     assert (batch["trace_draft_topk_ids"][0, 1] == -1).all()
     assert batch["trace_draft_topk_ids"][1, 1].tolist() == candidate_ids
@@ -917,6 +1118,67 @@ def test_rejected_sampled_k3_uses_asymmetric_tail_policy() -> None:
     assert distribution["linearized_count"].item() == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("delta", [-30.0, -1000.0])
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_rejected_negative_tail_restores_corrective_gradient(
+    monkeypatch, delta: float, asymmetric: bool,
+) -> None:
+    model = _small_dspark_training_model(
+        accepted_asymmetric_k3_enabled=False,
+        rejected_asymmetric_k3_enabled=asymmetric,
+    )
+    logits = torch.zeros(1, 32, requires_grad=True)
+    monkeypatch.setattr(model, "_full_vocab_logits", lambda *args: logits)
+    log_q = -math.log(32)
+    loss, denominator, *_ = model._compute_rejected_sampled_k3(
+        draft_hidden=torch.zeros(1, 8),
+        prev_token_ids=torch.tensor([1]),
+        rejected_token_ids=torch.tensor([3]),
+        teacher_logprobs=torch.tensor([log_q + delta]),
+        weights=torch.ones(1),
+        lm_head_weight=torch.zeros(32, 8),
+    )
+    loss.backward()
+    assert denominator.item() == 1
+    assert torch.isfinite(logits.grad).all()
+    if asymmetric:
+        assert loss.item() == pytest.approx(-delta - 1, abs=1e-4)
+        expected = torch.full_like(logits, -1 / 32)
+        expected[0, 3] += 1
+        # Gradient descent must suppress the rejected token, not reinforce it.
+        torch.testing.assert_close(logits.grad, expected, atol=1e-6, rtol=1e-6)
+    else:
+        assert loss.item() == pytest.approx(10)
+        assert torch.count_nonzero(logits.grad) == 0
+
+
+@pytest.mark.parametrize("delta", [4.0, 30.0])
+def test_rejected_positive_tail_keeps_linearization_and_upper_cap(monkeypatch, delta):
+    model = _small_dspark_training_model(rejected_asymmetric_k3_enabled=True)
+    # The candidate is unlikely under q, allowing positive log(p/q) with valid p.
+    logits = torch.zeros(1, 32)
+    logits[0, 3] = -40
+    logits.requires_grad_()
+    monkeypatch.setattr(model, "_full_vocab_logits", lambda *args: logits)
+    log_q = torch.log_softmax(logits.detach(), dim=-1)[0, 3]
+    outputs = model._compute_rejected_sampled_k3(
+        draft_hidden=torch.zeros(1, 8), prev_token_ids=torch.tensor([1]),
+        rejected_token_ids=torch.tensor([3]), teacher_logprobs=(log_q + delta).reshape(1),
+        weights=torch.ones(1), lm_head_weight=torch.zeros(32, 8),
+    )
+    loss = outputs[0]
+    loss.backward()
+    capped_delta = min(delta, 20)
+    slope = math.exp(2) - 1
+    assert loss.item() == pytest.approx(math.exp(2) - 3 + slope * (capped_delta - 2))
+    if delta > 20:
+        assert torch.count_nonzero(logits.grad) == 0
+    else:
+        expected = slope * torch.softmax(logits.detach(), dim=-1)
+        expected[0, 3] -= slope
+        torch.testing.assert_close(logits.grad, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_asymmetric_k3_stream_switches_can_select_rejected_only() -> None:
     model = _small_dspark_training_model(
         block_size=2,
@@ -1102,6 +1364,8 @@ def test_dspark_default_loss_weights_match_draft_opd():
     assert model.accepted_k3_alpha == pytest.approx(1.0)
     assert model.accepted_fkl_alpha == pytest.approx(0.0)
     assert model.rejected_k3_alpha == pytest.approx(1.0)
+    assert model.rejected_aux_alpha == pytest.approx(0.0)
+    assert model.rejected_prefix_length == 0
     assert model.response_stream_weight == pytest.approx(1.0)
     assert model.rejected_stream_weight == pytest.approx(1.0)
     assert model.rejected_position_decay == pytest.approx(0.9)

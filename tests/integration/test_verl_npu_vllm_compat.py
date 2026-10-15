@@ -72,6 +72,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
+        "install_verl_npu_optimizer_offload_compat",
+        lambda: events.append("optimizer_offload"),
+    )
+    monkeypatch.setattr(
+        compat,
         "install_verl_npu_checkpoint_load_compat",
         lambda: events.append("checkpoint_load"),
     )
@@ -97,11 +102,60 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     assert events == [
         "compat",
         "training_output_release",
+        "optimizer_offload",
         "checkpoint_load",
         "reclaim",
         "fsdp2_export",
         "base",
     ]
+
+
+def test_npu_optimizer_offload_uses_blocking_cpu_copy(monkeypatch) -> None:
+    events = []
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+        def to(self, device, non_blocking):
+            events.append((self.value, device, non_blocking))
+            return FakeTensor(self.value)
+
+    class FakeTorch:
+        Tensor = FakeTensor
+
+        @staticmethod
+        def no_grad():
+            return lambda function: function
+
+    fsdp_utils_module = types.SimpleNamespace(
+        torch=FakeTorch,
+        offload_fsdp_optimizer=lambda optimizer: None,
+    )
+    engine_module = types.SimpleNamespace(
+        offload_fsdp_optimizer=fsdp_utils_module.offload_fsdp_optimizer,
+    )
+    modules = {
+        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
+        "verl.utils.fsdp_utils": fsdp_utils_module,
+        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_NPU_OPTIMIZER_OFFLOAD_APPLIED", False)
+
+    param = object()
+    optimizer = types.SimpleNamespace(
+        state={param: {"step": FakeTensor(1), "exp_avg": FakeTensor(2)}},
+        param_groups=[{"params": [param]}],
+    )
+
+    assert compat.install_verl_npu_optimizer_offload_compat(modules.__getitem__) is True
+    assert fsdp_utils_module.offload_fsdp_optimizer is engine_module.offload_fsdp_optimizer
+    engine_module.offload_fsdp_optimizer(optimizer)
+
+    assert events == [(1, "cpu", False), (2, "cpu", False)]
+    assert optimizer.state[param]["step"].value == 1
+    assert compat.install_verl_npu_optimizer_offload_compat(modules.__getitem__) is False
 
 
 def test_npu_checkpoint_load_maps_global_tag_to_actor_local_device(monkeypatch) -> None:

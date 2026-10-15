@@ -277,6 +277,12 @@ class SpecoTaskRunner(TaskRunner):
         )
         if not enable_drafter:
             return None
+        if (config.actor_rollout_ref.rollout.drafter.training.get("frozen_actor_lr_enabled", False)
+                or config.actor_rollout_ref.rollout.drafter.training.get(
+                    "dspark_directional_compare_enabled", False)):
+            from verl_speco.workers.frozen_actor_lr_worker import FrozenActorLRWorker
+
+            return ray.remote(FrozenActorLRWorker)
         return ray.remote(SpecoWorker)
 
     def _with_speco_rollout_publish_mixin(self, worker_cls, config):
@@ -379,7 +385,24 @@ class SpecoTaskRunner(TaskRunner):
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        trainer = SpecoRayPPOTrainer(
+        trainer_cls = SpecoRayPPOTrainer
+        if config.actor_rollout_ref.rollout.drafter.training.get(
+            "dspark_directional_diagnostic_enabled", False
+        ):
+            from verl_speco.trainer.directional_diagnostic_trainer import DirectionalDiagnosticTrainer
+
+            trainer_cls = DirectionalDiagnosticTrainer
+        elif config.actor_rollout_ref.rollout.drafter.training.get(
+            "dspark_directional_compare_enabled", False
+        ):
+            from verl_speco.trainer.directional_compare_trainer import DirectionalCompareTrainer
+
+            trainer_cls = DirectionalCompareTrainer
+        elif config.actor_rollout_ref.rollout.drafter.training.get("frozen_actor_lr_enabled", False):
+            from verl_speco.trainer.frozen_actor_lr_trainer import FrozenActorLRTrainer
+
+            trainer_cls = FrozenActorLRTrainer
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
