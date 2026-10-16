@@ -1,0 +1,20 @@
+..................                                                       [100%]
+=============================== warnings summary ===============================
+../../../../workspace/main_env_next/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /workspace/main_env_next/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+verl_speco/models/eagle/llama_eagle.py:39
+  /data1/heyuhang/workspace/verl-SpeCo/verl_speco/models/eagle/llama_eagle.py:39: UserWarning: flash_attn is not found, falling back to flex_attention. Please install flash_attn if you want to use the flash attention backend.
+    warnings.warn(
+
+../../../../workspace/main_env_next/lib/python3.12/site-packages/ray/util/state/util.py:55
+  /workspace/main_env_next/lib/python3.12/site-packages/ray/util/state/util.py:55: DeprecationWarning: Ray state API is no longer experimental. Please import from `ray.util.state`. instead. Importing from `ray.experimental` will be deprecated in future releases. 
+    warnings.warn(
+
+../../../../workspace/main_env_next/lib/python3.12/site-packages/verl/workers/engine/mindspeed/transformer_impl.py:24
+  /workspace/main_env_next/lib/python3.12/site-packages/verl/workers/engine/mindspeed/transformer_impl.py:24: UserWarning: NPU not support router replay for now.
+    from verl.utils.megatron.router_replay_patch import RouterReplay
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+18 passed, 17 warnings in 11.73s

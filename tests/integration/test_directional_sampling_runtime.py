@@ -14,6 +14,51 @@ from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 from verl_speco.workers.speco_worker import SpecoWorker
 
 
+@pytest.mark.parametrize("world_size", [8, 16])
+def test_diagnostic_manifest_uses_configured_replica_count(tmp_path, world_size):
+    import json
+    from verl_speco.trainer.directional_diagnostic_trainer import DirectionalDiagnosticTrainer
+
+    for rank in range(0, world_size, 4):
+        (tmp_path / f"candidates_rank{rank:02d}.jsonl").write_text(
+            json.dumps({"sample_id": str(rank), "selected": True}) + "\n"
+        )
+        (tmp_path / f"paired_rank{rank:02d}_sample.pt").touch()
+    source = tmp_path / "train.parquet"
+    source.write_bytes(b"training-source")
+    trainer = object.__new__(DirectionalDiagnosticTrainer)
+    trainer.global_steps = 5
+    trainer._directional_pair_seconds = 1.0
+    trainer.config = OmegaConf.create({
+        "trainer": {"n_gpus_per_node": world_size, "nnodes": 1},
+        "data": {"seed": 17, "train_files": [str(source)]},
+        "actor_rollout_ref": {
+            "actor": {"ulysses_sequence_parallel_size": 4},
+            "model": {"path": "actor"},
+            "rollout": {"tensor_model_parallel_size": 4, "drafter": {
+                "model_path": "draft", "training": {
+                    "training_interval_steps": 5, "worker_world_size": world_size,
+                    "dspark_directional_diagnostic_output": str(tmp_path),
+                    "dspark_num_anchors": 32, "dspark_max_window": 512,
+                    "max_collect_tokens_per_step_per_replica": 32768,
+                },
+            }},
+        },
+    })
+    trainer._ablation_generation_cohorts = [["training"]]
+    trainer._speco_entropy_lr = lambda: SimpleNamespace(prepare_validation_cohort=lambda:
+        SimpleNamespace(non_tensor_batch={"raw_prompt": ["validation"]}))
+    trained, _ = trainer._speco_train_drafter()
+    manifest = json.loads((tmp_path / "paired_panel_manifest.json").read_text())
+    assert not trained
+    assert manifest["independent_data_replicas"] == world_size // 4
+    assert manifest["selected_count"] == world_size // 4
+    assert manifest["drafter_optimizer_steps"] == 0
+    (tmp_path / "candidates_rank01.jsonl").write_text('{}\n')
+    with pytest.raises(RuntimeError, match="SP-leader"):
+        trainer._speco_train_drafter()
+
+
 def test_directional_compare_records_prompts_and_calls_parent_generation(monkeypatch):
     trainer = object.__new__(DirectionalCompareTrainer)
     batch = SimpleNamespace(non_tensor_batch={"raw_prompt": [[{"role": "user", "content": "x"}]]})
@@ -97,6 +142,15 @@ def test_paired_probe_uses_identical_prefix_and_current_actor_head():
     assert detailed["old"].shape == detailed["new"].shape == detailed["draft"].shape == (1, 2)
     assert torch.allclose(detailed["draft"], detailed["repeat_draft"])
     assert "_speco_directional_probe" not in item
+
+    item["hidden_states_layout"] = "dflash_aux_plus_last"
+    old_aux_plus_last = torch.cat([torch.zeros(1, 3, 4), old_hidden], dim=-1)
+    detailed = trainer.score_directional_candidates(
+        item, old_sample, old_aux_plus_last, head.weight,
+        diagnostic=True, selected_anchors=[0],
+    )
+    assert detailed["old_feature_draft"] is not None
+    assert torch.allclose(detailed["old_feature_draft"], detailed["draft"])
 
     old_sample["input_ids"][0, 0] = 9
     with pytest.raises(ValueError, match="different token prefixes"):

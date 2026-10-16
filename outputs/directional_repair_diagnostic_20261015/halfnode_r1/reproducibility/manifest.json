@@ -1,0 +1,82 @@
+{
+  "recorded_at": "2026-10-15T07:26:43-0400",
+  "git_commit": "13624b06f8b43c75e556423a2ac12d22209d6994",
+  "git_branch": "experiment",
+  "git_remotes": [
+    "fork\thttps://github.com/Zl-Hhhhhh/verl-SpeCo.git (fetch)",
+    "fork\thttps://github.com/Zl-Hhhhhh/verl-SpeCo.git (push)",
+    "origin\thttps://github.com/verl-project/verl-SpeCo.git (fetch)",
+    "origin\thttps://github.com/verl-project/verl-SpeCo.git (push)"
+  ],
+  "script_sha256": {
+    "outputs/experiment_setup/directional_repair_diagnostic_20261015/run.sh": "8f753c7b05a11ad52fef69ed1d7c09c76f75a43885930cb3f9c5502ae9950a95",
+    "outputs/experiment_setup/directional_repair_diagnostic_20261015/execute_halfnode.sh": "693d4309d586b54a44c8755b598d932d4160638910f93acee5c16fd17e508eee",
+    "outputs/experiment_setup/directional_repair_diagnostic_20261015/preflight.py": "0c5eb5667803afbd0c907cd8c97647bb0a1613735421499088afa03b065443c8",
+    "outputs/experiment_setup/directional_repair_diagnostic_20261015/analyze.py": "4b423f4a1432da4620ae2b84735741280a79c325534c284706ec305980f2a17b",
+    "tools/monitor_experiment_memory.py": "eb63522b39c1175f26cb3deb0872a9387fdd685255092ba3b346abdd8ef40df2",
+    "verl_speco/integration/npu_sleep_compat.py": "8099c0b54865d3574706bb17760b649a1033b19360fefe448279253c8f5b04f9",
+    "verl_speco/integration/vllm_runtime.py": "52be235a8f44780d0da4af12d60d884a106b9b4873435f00292c3d9e1a9a02c4",
+    "verl_speco/trainer/base_trainer.py": "24ac690145651b5968904aea278b8a0161e89a4de53a5c64a9bd07eaf15150a9",
+    "verl_speco/trainer/directional_diagnostic_trainer.py": "c7b1d7678999eb65637301c39d1c59fb7bd230f6936b0652ae6e38b5d03462aa",
+    "tools/report_directional_diagnostic.py": "54f424fde39e20378a2c957ce543b91aa87e13d4938f83a3016093bbaebbbe28",
+    "tests/unit/test_directional_diagnostic_analyzer.py": "84da84373e5f9bf3cfa91faad60ca98e598b6700284036b25e606b7233e23feb",
+    "docs/directional_repair_diagnostic_results_20261015.md": "348e7bef27fcdb151fe599f04c704e8f683cf782a3989c917ec01a2c720142a8"
+  },
+  "physical_cards": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "logical_devices": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "memory_guard": {
+    "minimum_available_gib": 32,
+    "consecutive_samples": 2,
+    "interval_seconds": 10
+  },
+  "run_id": "83916b64-aa58-4368-9fef-dc99f3e3fa7b",
+  "runtime_tests": {
+    "passed": 58,
+    "log": "runtime_tests.log"
+  },
+  "hardware_sleep_wake_check": {
+    "logical_devices": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "tensor_bytes": 1048576,
+    "exact_equality": true,
+    "backup_pinned": false
+  },
+  "external_environment_changes_document": "RUN.md",
+  "analyzer_updated_at": "2026-10-15T07:29:34-0400",
+  "analyzer_coverage": {
+    "basic_candidate_metrics": "all candidates",
+    "repair_target_checks": "selected top-m",
+    "feature_drift": "selected paired prefixes with both feature tensors",
+    "cohort_denominators": "all candidates and selected top-m reported separately"
+  },
+  "postprocessing_completed_at": "2026-10-15T09:14:23-0400",
+  "postprocessing_notes": "Disable dictionary encoding; Parquet selection flag stored as int8; full-precision JSONL; complete scalar audit and Matplotlib plots using pre-existing host Python packages.",
+  "validation": {
+    "related_tests_passed": 18,
+    "updated_parquet_regression_passed": 1,
+    "artifact_readback": "artifact_readback.log",
+    "result_audit": "result_audit.json"
+  }
+}

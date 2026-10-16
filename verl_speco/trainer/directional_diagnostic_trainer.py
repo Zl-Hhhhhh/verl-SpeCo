@@ -16,7 +16,17 @@ class DirectionalDiagnosticTrainer(DirectionalCompareTrainer):
         root = Path(str(cfg.dspark_directional_diagnostic_output))
         candidate_files = sorted(root.glob("candidates_rank*.jsonl"))
         sample_files = sorted(root.glob("paired_rank*.pt"))
-        if len(candidate_files) != 4 or not sample_files:
+        rollout = self.config.actor_rollout_ref.rollout
+        trainer_cfg = self.config.trainer
+        worker_world_size = int(cfg.get("worker_world_size") or (
+            int(trainer_cfg.n_gpus_per_node) * int(trainer_cfg.nnodes)
+        ))
+        sp_size = int(self.config.actor_rollout_ref.actor.ulysses_sequence_parallel_size)
+        if worker_world_size <= 0 or sp_size <= 0 or worker_world_size % sp_size:
+            raise ValueError("Directional diagnostic has an invalid worker/SP topology")
+        leader_ranks = list(range(0, worker_world_size, sp_size))
+        expected_files = {f"candidates_rank{rank:02d}.jsonl" for rank in leader_ranks}
+        if {path.name for path in candidate_files} != expected_files or not sample_files:
             raise RuntimeError("Directional diagnostic is missing SP-leader artifacts")
         candidates = [json.loads(line) for path in candidate_files
                       for line in path.read_text(encoding="utf-8").splitlines()]
@@ -53,6 +63,12 @@ class DirectionalDiagnosticTrainer(DirectionalCompareTrainer):
             "actor_model": str(self.config.actor_rollout_ref.model.path),
             "drafter_model": str(self.config.actor_rollout_ref.rollout.drafter.model_path),
             "seed": self.config.data.seed,
+            "worker_world_size": worker_world_size,
+            "sequence_parallel_size": sp_size,
+            "tensor_parallel_size": int(rollout.tensor_model_parallel_size),
+            "independent_data_replicas": len(leader_ranks),
+            "sp_leader_ranks": leader_ranks,
+            "max_collect_tokens_per_replica": int(cfg.max_collect_tokens_per_step_per_replica),
             "candidate_count": len(candidates),
             "selected_count": len(selected),
             "selected_sample_files": len(sample_files),

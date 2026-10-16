@@ -1,0 +1,4 @@
+candidate_scores Parquet and full-precision JSONL readback match: 8192
+selected_target_metrics Parquet and full-precision JSONL readback match: 2048
+Two-sided candidate denominator matches raw candidates and stored report
+PASS

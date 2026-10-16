@@ -1,0 +1,122 @@
+{
+  "status": "passed",
+  "platform": "Linux-5.10.0-216.0.0.115.oe2203sp4.aarch64-aarch64-with-glibc2.34",
+  "python": "3.12.13",
+  "versions": {
+    "torch": "2.10.0",
+    "torch-npu": "2.10.0.post2",
+    "vllm": "0.26.0+empty",
+    "vllm-ascend": "0.1.dev1+ge592b2e79.d20260811",
+    "verl": "0.8.0.dev0",
+    "verl-speco": "0.1.0",
+    "ray": "2.56.1",
+    "transformers": "5.14.1",
+    "triton-ascend": "3.2.1"
+  },
+  "device_type": "A3",
+  "visible_devices": "8,9,10,11,12,13,14,15",
+  "device_checks": [
+    {
+      "local_device": 0,
+      "physical_logical_device": 8,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 1,
+      "physical_logical_device": 9,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 2,
+      "physical_logical_device": 10,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 3,
+      "physical_logical_device": 11,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 4,
+      "physical_logical_device": 12,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 5,
+      "physical_logical_device": 13,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 6,
+      "physical_logical_device": 14,
+      "matmul": "pass"
+    },
+    {
+      "local_device": 7,
+      "physical_logical_device": 15,
+      "matmul": "pass"
+    }
+  ],
+  "custom_operator_libraries_loaded": [
+    "/workspace/main_env_next/lib/python3.12/site-packages/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so",
+    "/workspace/main_env_next/lib/python3.12/site-packages/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so"
+  ],
+  "runtime_setup": "/workspace/main_env_next/bin/activate-speco-local.sh",
+  "source_sha256": {
+    "train": "cdb223011baebcc1bd600d563b7c0b9559610df96c9ca33acc8556a70fa38b89",
+    "test": "a94a87fd700142538db1d0e089e81ca98be477c4208163301adb66aab5979bb6"
+  },
+  "actor_train_file": "/data1/heyuhang/workspace/verl-SpeCo/outputs/directional_repair_diagnostic_20261015/halfnode_r1/actor_train_disjoint.parquet",
+  "actor_train_sha256": "cdb223011baebcc1bd600d563b7c0b9559610df96c9ca33acc8556a70fa38b89",
+  "source_training_rows": 1791700,
+  "actor_training_rows": 1791700,
+  "validation_rows": 960,
+  "independent_validation_prompts": 30,
+  "excluded_source_row_indices": [],
+  "validation_prompt_sha256": [
+    "0ba6984eae59f18ba387475c03f2dca3f0fa4b6b6df7f2dfd421aad1ee0ae389",
+    "0e9985fd95acd5e3dd9c7b9654f00241eb6a535c101c66890e04688cc55e23a3",
+    "1e3ad930c3535c70b046acfe9021b3669c1fce77b9e952aa8efefc7701b9d0e7",
+    "20d55ee3b3882c9369d7faa3fa42f4f8a4b6d9a9378ec73d9846fd6a2f2f4f0d",
+    "290532ef1b82e5fb92274300f6f0f5a17b2fe7581aa8ee0a897d66000f8eb286",
+    "3bab911d8f34d3117d06fa175d48cdfe0dac9f2e8e228ff0ff94e07f463d24b2",
+    "3c02bb22a3aac32a2c505e67208d9fca14d903874463e0f3be635cdec3619885",
+    "424ce3aa2b431d2aa133926080b8e826aba93f98788d0802c23221079d554a52",
+    "42ae7c169c3283e0deae1c9ae1e06fccca0f7eb139c480325c0dc14f4dc1798c",
+    "55a19903b06b61a7d767f06a860dee4937798818599d9e80c70c6b09c054c294",
+    "5a28d083e266590e7a407e13cdf9e74930880eb40321a7e5e9f23fe1b87bcc16",
+    "68366f6e0bcf9eac9e3214be9734789834b105ed9ceec015621e96fb161b2547",
+    "6e419a728e43b98f5e32153a62786631ceed97aebe9ca7c2efbb015f21ebb891",
+    "6f477779a5d3bfca34c2ea7cb572346e2a39c71772185af047b3d7807d9095f8",
+    "7050bc0284e3b940880c5ea9a4ae6cfb3a1e0cbbfaba6acf6a0b262cf54c0bb4",
+    "751c5b0b79913d84b208c3dd4e069efccbeedcd1242c812a3a6903ce84a11e6f",
+    "75efc897cb8d612e0c8813e2387cbb87c5d0773c0e568d7962b7bc362f442a3e",
+    "7ed12b446a11d9f6490a9fbf6a91bebee8aeb5308a52614333a5a25236ea771c",
+    "8a5a18ac73fed052f3603623a3a88d59f5885ef1854ff50f025057535422be54",
+    "9104e4d70f87a1e7646e8d34625d8234ed3539eb072a80260d086711d1b6c373",
+    "9e75ce06629bdc5fc403f14a1086ad301769a8f799fc70cabd4acfb31c4b29cb",
+    "b1d88aaac7f1b389322547d656007ca4c80735b62ac1449f7059a3b1cc252c62",
+    "b6b44640270e0e58606a5ee9148082bb574d3070a8ec4a251f6cface80485ac0",
+    "b7d36b744f2351652a57093b1689a1ee01f0df3b71c822a8a3fbb31b25c04705",
+    "b8100e8fb23d84cc3c70ac240c06669dac7ac84f4fb11fc0409f2a5e5b79195c",
+    "c3d8f146af0d5d58dbfc4963bfdfe6d3fddcbfdc6324ae5f49339e011aa46c4b",
+    "c6f584b2c4330654fb8dc332be5c8714f2022a115469faf5daebecc3ca5d4d93",
+    "d5ee62f2dc76961ccbf14dc2064b7d6e76b907ab6224dce6bcc8fdb03da0e3ac",
+    "e20af4726e5e79970ca3378d8e06325c1fac7ee867b67e75fdc36d57fd6f19e6",
+    "ec771e2931fef597f0df7d8ce7f5a1cb7c4d7f68c09685a5a3ab829f7392fa03"
+  ],
+  "seed": 17,
+  "training_validation_overlap": 0,
+  "budget_adaptation": {
+    "logical_devices": 8,
+    "independent_replicas": 2,
+    "tp": 4,
+    "sp": 4,
+    "max_samples_per_replica": 40,
+    "holdout_samples_per_replica": 8,
+    "max_tokens_per_replica": 32768,
+    "global_max_tokens": 65536,
+    "max_selected_training_positions": 2048
+  },
+  "base_commit": "13624b06f8b43c75e556423a2ac12d22209d6994"
+}

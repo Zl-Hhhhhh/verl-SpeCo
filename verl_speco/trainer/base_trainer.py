@@ -5176,9 +5176,15 @@ class DrafterBaseTrainer:
                     repeat_q = torch.softmax(repeat_q_logits.float(), -1)
                     q_old = None
                     context_positions = batch["position_ids"][0].long().cpu().tolist()
-                    if (old_hidden.size(-1) == context.size(-1)
+                    old_context_hidden = old_hidden
+                    if (item.get("hidden_states_layout") == "dflash_aux_plus_last"
+                            and old_hidden.size(-1) == context.size(-1) + hidden_size):
+                        # Actor scoring uses the final hidden row; drafter context
+                        # uses only the preceding auxiliary layer features.
+                        old_context_hidden = old_hidden[..., :context.size(-1)]
+                    if (old_context_hidden.size(-1) == context.size(-1)
                             and all(int(position) in lookup for position in context_positions)):
-                        old_context = old_hidden.index_select(
+                        old_context = old_context_hidden.index_select(
                             0, torch.tensor([lookup[int(p)] for p in context_positions])
                         ).to(device=device, dtype=context.dtype).unsqueeze(0)
                         old_features = list(old_context.split(old_context.size(-1) // num_layers, -1))

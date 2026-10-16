@@ -3945,6 +3945,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
     def __new__(cls, **kwargs):
+        from verl_speco.integration.npu_sleep_compat import install_pageable_npu_sleep
+
+        install_pageable_npu_sleep()
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:

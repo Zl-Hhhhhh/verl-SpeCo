@@ -1,0 +1,90 @@
+{
+  "passed": true,
+  "candidate_positions": 8192,
+  "selected_positions": 2048,
+  "candidate_positions_per_response": {
+    "128": 64
+  },
+  "selected_positions_per_response": {
+    "32": 64
+  },
+  "distinct_selected_prefix_hashes": 2048,
+  "selected_mass_fraction": 0.9164564160560457,
+  "minimum_available_gib": 66.58038330078125,
+  "initial_swap_used_gib": 162.42975997924805,
+  "maximum_swap_used_gib": 210.00397872924805,
+  "maximum_hbm_mib": 49758,
+  "memory_guard_triggered": false,
+  "actor_steps": [
+    {
+      "step": 1.0,
+      "timing_s/gen": 497.6450199186802,
+      "timing_s/update_actor": 261.9105925578624,
+      "timing_s/step": 832.830218160525,
+      "response_length/clip_ratio": 0.5375000238418579,
+      "drafter/spec_decode/mean_acceptance_length": 3.3717556235857846
+    },
+    {
+      "step": 2.0,
+      "timing_s/gen": 555.2941345348954,
+      "timing_s/update_actor": 196.380194760859,
+      "timing_s/step": 803.1687715481967,
+      "response_length/clip_ratio": 0.6031249761581421,
+      "drafter/spec_decode/mean_acceptance_length": 3.264109302948003
+    },
+    {
+      "step": 3.0,
+      "timing_s/gen": 566.3428946007043,
+      "timing_s/update_actor": 155.40856337547302,
+      "timing_s/step": 773.2515651527792,
+      "response_length/clip_ratio": 0.578125,
+      "drafter/spec_decode/mean_acceptance_length": 3.147412657647935
+    },
+    {
+      "step": 4.0,
+      "timing_s/gen": 555.5822379402816,
+      "timing_s/update_actor": 153.4538349416107,
+      "timing_s/step": 758.9285034276545,
+      "response_length/clip_ratio": 0.5093749761581421,
+      "drafter/spec_decode/mean_acceptance_length": 3.111883715613808
+    },
+    {
+      "step": 5.0,
+      "timing_s/gen": 522.9969934523106,
+      "timing_s/update_actor": 154.71097053401172,
+      "timing_s/step": 935.5773486606777,
+      "response_length/clip_ratio": 0.528124988079071,
+      "drafter/spec_decode/mean_acceptance_length": 3.268771333619533
+    }
+  ],
+  "greedy_counts": {
+    "eta0.5_direction": {
+      "changed": 39,
+      "beneficial": 24,
+      "harmful": 13,
+      "unchanged_probability": 2011,
+      "mean_gain": 0.006781073055435627
+    },
+    "eta0.5_all_mismatch": {
+      "changed": 32,
+      "beneficial": 32,
+      "harmful": 0,
+      "unchanged_probability": 2016,
+      "mean_gain": 0.007980533755926444
+    },
+    "eta1_direction": {
+      "changed": 44,
+      "beneficial": 29,
+      "harmful": 13,
+      "unchanged_probability": 2006,
+      "mean_gain": 0.007950748710982225
+    },
+    "eta1_all_mismatch": {
+      "changed": 35,
+      "beneficial": 35,
+      "harmful": 0,
+      "unchanged_probability": 2013,
+      "mean_gain": 0.008578621939250297
+    }
+  }
+}

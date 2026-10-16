@@ -1,8 +1,8 @@
 # 定向概率修复：实验计划（第 1–3 项）
 
-日期：2026-10-15。状态：**第 1 阶段诊断已实现，但等待队列已按用户要求取消；真实配对探针未启动。第 2、3 阶段未启动。**
+日期：2026-10-15。状态：**第 1 阶段半节点 actor0→5 配对诊断已完成。第 1 项结果和复现代码已归档；本次提交仅涵盖第 1 项。**
 
-第 1 阶段入口：`outputs/experiment_setup/directional_repair_diagnostic_20261015/run.sh`。2026-10-15 10:13 UTC 检测到全部 16 张 NPU 被另一用户占用，原等待进程随后按用户要求停止；不会自动启动。状态与日志位于 `outputs/directional_repair_diagnostic_20261015/r1/`。单元、运行时与分析产物测试共 16 项通过；NPU 端到端结果仍待采集。
+第 1 阶段入口：`outputs/experiment_setup/directional_repair_diagnostic_20261015/run.sh`。按用户要求仅使用物理卡 4–7（逻辑设备 8–15），TP/SP=4、2 个数据副本；保持全局采集预算。实际得到 8,192 个候选、2,048 个选中位置和 64 条响应，drafter 更新为 0。完整概率及修复目标检查覆盖选中位置；其余候选保存标量统计。报告见[第 1 阶段结果](directional_repair_diagnostic_results_20261015.md)，产物与日志位于 `outputs/directional_repair_diagnostic_20261015/halfnode_r1/`。全程最低可用内存 66.58 GiB，未触发用户指定的 32 GiB 保护阈值。
 
 目标：在有限 drafter 更新预算下，验证把 actor 本周期新增的过量概率定向转移至新增缺口，是否比直接蒸馏当前 actor、或搬运相同总量的普通失配修复更有效。
 
